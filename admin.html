@@ -39,10 +39,49 @@
         <div class="btn-group">
           <select id="f-branch" class="inline-select"></select>
           <button type="button" id="btn-copy-site" class="btn">複製家長劃位網址</button>
+          <button type="button" id="btn-import" class="btn">整份名冊匯入</button>
           <button type="button" id="btn-new" class="btn primary">＋ 新增班級</button>
         </div>
       </div>
       <div id="admin-class-list" class="card-list"></div>
+    </section>
+
+    <!-- 整份名冊匯入 -->
+    <section id="view-import" class="hidden">
+      <button type="button" class="btn-link js-back">← 回班級列表</button>
+      <h2 class="section-title">整份名冊匯入</h2>
+      <div class="panel">
+        <p class="small">從名冊選取「學生姓名、家長手機、班級」三欄複製，貼在下面。含標題列也沒關係。系統會依<b>班級名稱</b>把學生分到各班。</p>
+        <ul class="small muted tight">
+          <li>班級名稱要和後台的班級名稱一樣（空白、大小寫不影響）。</li>
+          <li>同一位學生上多個班：寫成多列，或在班級欄用「、」分隔。</li>
+          <li>不同學期有同名班級時，請先選學期。</li>
+        </ul>
+        <div class="form-grid">
+          <label>只對應這個學期的班級
+            <select id="i-term"></select>
+          </label>
+          <label>只對應這個分校的班級
+            <select id="i-branch"></select>
+          </label>
+        </div>
+        <p class="small muted">第一次使用、或想先把系統裡現有的名單倒回名冊：<button type="button" id="btn-export-all" class="btn small">匯出目前系統名冊（依上面的學期／分校）</button></p>
+        <textarea id="i-text" rows="10" placeholder="學生姓名	家長手機	班級&#10;王小明	0912345678	高一數學A班&#10;王小明	0912345678	高一英文&#10;李大華	0987654321	高一數學A班、高一英文"></textarea>
+        <p id="i-status" class="muted small"></p>
+      </div>
+
+      <div id="i-preview" class="hidden">
+        <h3 class="section-title">預覽比對</h3>
+        <div id="i-problems"></div>
+        <table class="table">
+          <thead><tr><th>班級</th><th>名冊人數</th><th>新加入</th><th>已在名單</th><th>名冊上沒有</th></tr></thead>
+          <tbody id="i-rows"></tbody>
+        </table>
+        <div id="i-removals" class="panel hidden"></div>
+        <div class="form-actions">
+          <button type="button" id="i-submit" class="btn primary">確認匯入</button>
+        </div>
+      </div>
     </section>
 
     <!-- 新增 / 編輯班級 -->
