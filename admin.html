@@ -32,23 +32,33 @@
       <button type="button" id="btn-logout2" class="btn">換一個帳號</button>
     </section>
 
-    <!-- 場次列表 -->
+    <!-- 班級列表 -->
     <section id="view-list" class="hidden">
       <div class="toolbar">
-        <h2 class="section-title">場次管理</h2>
-        <button type="button" id="btn-new" class="btn primary">＋ 新增場次</button>
+        <h2 class="section-title">班級管理</h2>
+        <div class="btn-group">
+          <select id="f-branch" class="inline-select"></select>
+          <button type="button" id="btn-copy-site" class="btn">複製家長劃位網址</button>
+          <button type="button" id="btn-new" class="btn primary">＋ 新增班級</button>
+        </div>
       </div>
-      <div id="admin-session-list" class="card-list"></div>
+      <div id="admin-class-list" class="card-list"></div>
     </section>
 
-    <!-- 新增 / 編輯場次 -->
+    <!-- 新增 / 編輯班級 -->
     <section id="view-editor" class="hidden">
-      <button type="button" class="btn-link js-back">← 回場次列表</button>
-      <h2 id="editor-title" class="section-title">新增場次</h2>
+      <button type="button" class="btn-link js-back">← 回班級列表</button>
+      <h2 id="editor-title" class="section-title">新增班級</h2>
       <form id="editor-form" class="editor">
         <div class="form-grid">
-          <label class="span2">場次名稱 *
-            <input id="e-title" type="text" required maxlength="60" placeholder="例：高一數學 12/5 模考">
+          <label class="span2">班級名稱 *
+            <input id="e-title" type="text" required maxlength="60" placeholder="例：高一數學 A 班">
+          </label>
+          <label>學期
+            <input id="e-term" type="text" maxlength="20" placeholder="例：115 上">
+          </label>
+          <label>上課時間
+            <input id="e-schedule" type="text" maxlength="40" placeholder="例：每週二 19:00-21:00">
           </label>
           <label>分校
             <select id="e-branch"></select>
@@ -56,14 +66,8 @@
           <label>教室
             <input id="e-room" type="text" maxlength="30" placeholder="例：301 教室">
           </label>
-          <label>日期 *
-            <input id="e-date" type="date" required>
-          </label>
-          <label>時間
-            <input id="e-time" type="text" maxlength="30" placeholder="例：19:00-21:00">
-          </label>
           <label class="span2">備註（會顯示在前台）
-            <textarea id="e-note" rows="2" maxlength="300" placeholder="例：請提早 10 分鐘入場"></textarea>
+            <textarea id="e-note" rows="2" maxlength="300" placeholder="例：座位整學期固定，如需更換請在劃位期間內自行調整"></textarea>
           </label>
         </div>
 
@@ -83,18 +87,18 @@
         <div id="editor-preview" class="seat-map-wrap"></div>
         <p id="editor-count" class="muted small center"></p>
 
-        <label class="check"><input id="e-open" type="checkbox"> 儲存後立即開放劃位</label>
+        <label class="check"><input id="e-open" type="checkbox"> 開放家長劃位</label>
 
         <div class="form-actions">
           <button type="button" class="btn js-back">取消</button>
-          <button type="submit" id="e-submit" class="btn primary">儲存場次</button>
+          <button type="submit" id="e-submit" class="btn primary">儲存班級</button>
         </div>
       </form>
     </section>
 
-    <!-- 場次名單 -->
+    <!-- 班級管理 -->
     <section id="view-detail" class="hidden">
-      <button type="button" class="btn-link js-back">← 回場次列表</button>
+      <button type="button" class="btn-link js-back">← 回班級列表</button>
       <div class="session-head">
         <h2 id="d-title"></h2>
         <p id="d-meta" class="muted"></p>
@@ -103,18 +107,50 @@
         <div id="d-stat"></div>
         <div class="btn-group">
           <button type="button" id="d-toggle" class="btn"></button>
-          <button type="button" id="d-copy" class="btn">複製劃位連結</button>
           <button type="button" id="d-export" class="btn">匯出 CSV</button>
         </div>
       </div>
+
       <div id="d-map" class="seat-map-wrap admin-map"></div>
-      <p class="muted small center">滑鼠移到座位上可看姓名與電話；點已劃位的座位可以取消該筆劃位。</p>
-      <table class="table">
-        <thead><tr><th>座位</th><th>姓名</th><th>手機</th><th>劃位時間</th><th></th></tr></thead>
-        <tbody id="d-rows"></tbody>
-      </table>
+      <p class="muted small center">點空位可以幫學生指定或更換座位；點有人的座位可以取消。</p>
+
+      <div class="detail-grid">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>學生名單 <span id="d-roster-count" class="muted small"></span></h3>
+            <label class="check inline"><input id="d-only-todo" type="checkbox"> 只看未劃位</label>
+          </div>
+          <table class="table">
+            <thead><tr><th>姓名</th><th>家長手機</th><th>座位</th><th></th></tr></thead>
+            <tbody id="d-rows"></tbody>
+          </table>
+        </div>
+
+        <div class="panel">
+          <h3>加入學生</h3>
+          <p class="muted small">一行一位，格式：<b>姓名、手機</b>（中間用逗號、空白或 Tab 隔開）。可以直接從 Google 試算表選取「姓名」「手機」兩欄複製貼上。</p>
+          <textarea id="d-import" rows="8" placeholder="王小明	0912345678&#10;李大華, 0987654321"></textarea>
+          <p id="d-import-preview" class="muted small"></p>
+          <button type="button" id="d-import-btn" class="btn primary block">加入名單</button>
+        </div>
+      </div>
     </section>
   </main>
+
+  <!-- 指定座位 -->
+  <div id="assign-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <form id="assign-form" class="modal-box">
+      <h3>指定座位：<span id="a-seat" class="seat-tag"></span></h3>
+      <label>選擇學生
+        <select id="a-student" required></select>
+      </label>
+      <p class="muted small">已有座位的學生會從原本的位子換過來。</p>
+      <div class="modal-actions">
+        <button type="button" id="a-cancel" class="btn">取消</button>
+        <button type="submit" class="btn primary">確定</button>
+      </div>
+    </form>
+  </div>
 
   <script type="module" src="js/admin.js"></script>
 </body>

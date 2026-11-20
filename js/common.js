@@ -1,4 +1,7 @@
-import { initializeApp, getAuth, getFirestore } from './firebase-sdk.js';
+import {
+  initializeApp, getAuth, getFirestore,
+  collection, doc, runTransaction, writeBatch, serverTimestamp
+} from './firebase-sdk.js';
 import { firebaseConfig } from './firebase-config.js';
 
 export const app = initializeApp(firebaseConfig);
@@ -35,22 +38,75 @@ export function normalizePhone(text) {
   return String(text || '').replace(/\D/g, '');
 }
 
+// 姓名去掉所有空白（全形、半形），避免「王 小明」和「王小明」被當成兩個人
+export function normalizeName(text) {
+  return String(text || '').replace(/[\s\u3000]/g, '');
+}
+
+export const isValidPhone = (phone) => /^09\d{8}$/.test(phone);
+
+// 學生代碼：家長手機_學生姓名（和 firestore.rules 的規則一致）
+export function studentKey(name, phone) {
+  return `${normalizePhone(phone)}_${normalizeName(name)}`;
+}
+
+/**
+ * 幫學生劃位或換位（前台、後台共用）
+ * 一次 transaction 完成：確認新位子空著 → 有舊位子就一起釋放 → 寫入新位子
+ */
+export async function takeSeat(cid, student, seatId) {
+  const { key, name, phone } = student;
+  const seatRef = doc(db, 'classes', cid, 'seats', seatId);
+  const holderRef = doc(db, 'classes', cid, 'holders', key);
+  const bookingRef = doc(collection(db, 'classes', cid, 'bookings'));
+  const bid = bookingRef.id;
+
+  await runTransaction(db, async (tx) => {
+    const seatSnap = await tx.get(seatRef);
+    const holderSnap = await tx.get(holderRef);
+    const old = holderSnap.exists() ? holderSnap.data() : null;
+    if (old && old.seatId === seatId) throw new Error('SAME_SEAT');
+    if (seatSnap.exists()) throw new Error('SEAT_TAKEN');
+    if (old) {
+      tx.delete(doc(db, 'classes', cid, 'seats', old.seatId));
+      tx.delete(doc(db, 'classes', cid, 'bookings', old.bid));
+    }
+    tx.set(seatRef, { bid, bookedAt: serverTimestamp() });
+    tx.set(bookingRef, { key, seatId, name, phone, bookedAt: serverTimestamp() });
+    tx.set(holderRef, { bid, seatId });
+  });
+}
+
+/** 取消某個學生的座位（前台、後台共用） */
+export async function releaseSeat(cid, key, holder) {
+  const batch = writeBatch(db);
+  batch.delete(doc(db, 'classes', cid, 'seats', holder.seatId));
+  batch.delete(doc(db, 'classes', cid, 'bookings', holder.bid));
+  batch.delete(doc(db, 'classes', cid, 'holders', key));
+  await batch.commit();
+}
+
 export function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (ch) => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
   ));
 }
 
-export function sessionSortKey(s) {
-  return `${s.date || ''} ${s.time || ''}`;
+// 班級排序：學期新的在前，同學期依分校、名稱
+export function classSort(a, b) {
+  return String(b.term || '').localeCompare(String(a.term || ''))
+    || String(a.branch || '').localeCompare(String(b.branch || ''))
+    || String(a.title || '').localeCompare(String(b.title || ''));
 }
 
-export function formatDate(dateStr) {
-  if (!dateStr) return '';
-  const d = new Date(dateStr + 'T00:00:00');
-  if (isNaN(d)) return dateStr;
-  const w = '日一二三四五六'[d.getDay()];
-  return `${d.getMonth() + 1}/${d.getDate()}（${w}）`;
+export function classMeta(c) {
+  return [c.term, c.schedule, c.branch, c.room].filter(Boolean).join('・');
+}
+
+// 座位代號排序：A1, A2, ..., A10, B1
+export function seatOrder(a, b) {
+  const ra = a.charCodeAt(0), rb = b.charCodeAt(0);
+  return ra !== rb ? ra - rb : parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10);
 }
 
 /**

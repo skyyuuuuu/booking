@@ -15,54 +15,51 @@
   <main class="container">
     <div id="notice" class="notice hidden"></div>
 
-    <!-- 場次列表 -->
-    <section id="view-sessions">
-      <h2 class="section-title">選擇場次</h2>
-      <div id="session-list" class="card-list">
-        <p class="muted">載入中…</p>
-      </div>
+    <!-- 1. 查詢學生 -->
+    <section id="view-login" class="hidden">
+      <h2 class="section-title">查詢學生</h2>
+      <form id="login-form" class="panel">
+        <label>學生姓名
+          <input id="l-name" type="text" maxlength="20" required autocomplete="off" placeholder="例：王小明">
+        </label>
+        <label>家長手機（報名時留的號碼）
+          <input id="l-phone" type="tel" inputmode="numeric" maxlength="12" required placeholder="0912345678">
+        </label>
+        <button type="submit" id="l-submit" class="btn primary block">查詢我的班級</button>
+      </form>
+      <div id="saved-students" class="saved hidden"></div>
     </section>
 
-    <!-- 座位圖 -->
+    <!-- 2. 學生的班級 -->
+    <section id="view-classes" class="hidden">
+      <div class="toolbar">
+        <h2 class="section-title"><span id="c-student"></span> 的班級</h2>
+        <button type="button" id="btn-switch" class="btn small">切換學生</button>
+      </div>
+      <div id="class-list" class="card-list"></div>
+    </section>
+
+    <!-- 3. 座位圖 -->
     <section id="view-seats" class="hidden">
-      <button type="button" id="btn-back" class="btn-link">← 回場次列表</button>
+      <button type="button" id="btn-back" class="btn-link">← 回班級列表</button>
       <div class="session-head">
         <h2 id="s-title"></h2>
         <p id="s-meta" class="muted"></p>
         <p id="s-note" class="note"></p>
       </div>
 
-      <div id="my-booking" class="my-booking hidden"></div>
+      <div id="my-booking" class="my-booking"></div>
 
       <div class="legend">
         <span><i class="seat available"></i>可劃位</span>
-        <span><i class="seat taken"></i>已劃走</span>
-        <span><i class="seat mine"></i>我的位子</span>
+        <span><i class="seat taken"></i>已有人</span>
+        <span><i class="seat mine"></i>我的座位</span>
       </div>
 
       <div id="seat-map" class="seat-map-wrap"></div>
-      <p class="muted small center">座位圖可左右滑動。點選空位即可劃位。</p>
+      <p class="muted small center">座位圖可左右滑動。點空位即可劃位；已經有座位的話，點其他空位可以換位。</p>
     </section>
   </main>
-
-  <!-- 劃位表單 -->
-  <div id="modal" class="modal hidden" role="dialog" aria-modal="true">
-    <form id="booking-form" class="modal-box">
-      <h3>確認劃位：<span id="m-seat" class="seat-tag"></span></h3>
-      <p id="m-session" class="muted small"></p>
-      <label>學生姓名
-        <input id="f-name" type="text" maxlength="20" required autocomplete="name">
-      </label>
-      <label>聯絡手機
-        <input id="f-phone" type="tel" inputmode="numeric" maxlength="12" placeholder="0912345678" required>
-      </label>
-      <p class="muted small">同一支手機每個場次只能劃一個位子。劃位紀錄會存在這台裝置的瀏覽器，若之後換手機或清除瀏覽資料，請聯絡櫃台協助更改。</p>
-      <div class="modal-actions">
-        <button type="button" id="m-cancel" class="btn">取消</button>
-        <button type="submit" id="m-submit" class="btn primary">確認劃位</button>
-      </div>
-    </form>
-  </div>
 
   <script type="module" src="js/app.js"></script>
 </body>

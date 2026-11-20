@@ -1,11 +1,12 @@
 import {
   onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut,
-  collection, doc, getDocs, onSnapshot, query, orderBy, setDoc, updateDoc,
-  writeBatch, serverTimestamp, getCountFromServer
+  collection, doc, getDocs, onSnapshot, setDoc, updateDoc,
+  writeBatch, serverTimestamp, getCountFromServer, arrayUnion, arrayRemove
 } from './firebase-sdk.js';
 import {
   auth, db, configMissing, renderSeatMap, buildSeatList, parseNumberList,
-  escapeHtml, formatDate, toast
+  normalizeName, normalizePhone, isValidPhone, studentKey, takeSeat, releaseSeat,
+  escapeHtml, classSort, classMeta, seatOrder, toast
 } from './common.js';
 import { ADMIN_EMAILS, BRANCHES } from './firebase-config.js';
 
@@ -13,14 +14,18 @@ const $ = (id) => document.getElementById(id);
 const VIEWS = ['view-login', 'view-denied', 'view-list', 'view-editor', 'view-detail'];
 
 const state = {
-  sessions: [],
+  classes: [],
   listUnsub: null,
   detailUnsubs: [],
-  detail: null,             // 目前查看的場次
-  detailSeats: new Map(),   // seatId -> { uid, bookedAt }
-  detailBookings: [],       // [{ uid, seatId, name, phone, bookedAt }]
-  editingId: null,          // null = 新增
-  disabled: new Set()       // 編輯中「不設座位」的格子
+  cid: null,                 // 目前管理中的班級
+  detail: null,
+  roster: new Map(),         // key -> { name, phone }
+  holders: new Map(),        // key -> { bid, seatId }
+  seats: new Map(),          // seatId -> { bid }
+  editingId: null,           // null = 新增
+  dupFrom: null,             // 複製來源班級 ID
+  disabled: new Set(),
+  assignSeat: null
 };
 
 function show(view) {
@@ -32,6 +37,15 @@ function showNotice(msg, type = 'info') {
   const n = $('notice');
   n.textContent = msg;
   n.className = `notice ${type}`;
+}
+
+// 一次最多寫 500 筆，分批送出
+async function commitInChunks(ops) {
+  for (let i = 0; i < ops.length; i += 400) {
+    const batch = writeBatch(db);
+    ops.slice(i, i + 400).forEach((fn) => fn(batch));
+    await batch.commit();
+  }
 }
 
 // ---------- 登入 ----------
@@ -82,11 +96,15 @@ function backToList() {
   show('view-list');
 }
 
-// ---------- 場次列表 ----------
+// ---------- 班級列表 ----------
+$('f-branch').innerHTML = ['<option value="">全部分校</option>']
+  .concat(BRANCHES.map((b) => `<option>${escapeHtml(b)}</option>`)).join('');
+$('f-branch').addEventListener('change', renderList);
+
 function startListening() {
   if (state.listUnsub) return;
-  state.listUnsub = onSnapshot(query(collection(db, 'sessions'), orderBy('date', 'desc')), (snap) => {
-    state.sessions = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  state.listUnsub = onSnapshot(collection(db, 'classes'), (snap) => {
+    state.classes = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort(classSort);
     renderList();
   }, (err) => {
     console.error(err);
@@ -101,88 +119,87 @@ function stopListening() {
 }
 
 function renderList() {
-  const box = $('admin-session-list');
-  if (!state.sessions.length) {
-    box.innerHTML = '<p class="muted">還沒有場次，按右上角「新增場次」開始。</p>';
+  const box = $('admin-class-list');
+  const branch = $('f-branch').value;
+  const list = state.classes.filter((c) => !branch || c.branch === branch);
+  if (!list.length) {
+    box.innerHTML = state.classes.length
+      ? '<p class="muted">這個分校還沒有班級。</p>'
+      : '<p class="muted">還沒有班級，按右上角「新增班級」開始。</p>';
     return;
   }
-  box.innerHTML = state.sessions.map((s) => `
+  box.innerHTML = list.map((c) => `
     <div class="card admin-card">
       <div class="card-main">
         <div class="card-title">
-          ${escapeHtml(s.title)}
-          <span class="badge ${s.open ? 'on' : 'off'}">${s.open ? '開放中' : '未開放'}</span>
+          ${escapeHtml(c.title)}
+          <span class="badge ${c.open ? 'on' : 'off'}">${c.open ? '開放劃位中' : '未開放'}</span>
         </div>
-        <div class="muted small">${escapeHtml(formatDate(s.date))} ${escapeHtml(s.time || '')}
-          ${escapeHtml([s.branch, s.room].filter(Boolean).join('・'))}</div>
-        <div class="small">已劃 <b class="cnt" data-sid="${s.id}">…</b> / ${s.seats?.length || 0}</div>
+        <div class="muted small">${escapeHtml(classMeta(c))}</div>
+        <div class="small">學生 <b class="cnt-roster" data-cid="${c.id}">…</b> 人・已劃位 <b class="cnt-held" data-cid="${c.id}">…</b>・座位 ${c.seats?.length || 0}</div>
       </div>
       <div class="btn-group">
-        <button type="button" class="btn small" data-act="detail" data-id="${s.id}">名單</button>
-        <button type="button" class="btn small" data-act="toggle" data-id="${s.id}">${s.open ? '關閉劃位' : '開放劃位'}</button>
-        <button type="button" class="btn small" data-act="edit" data-id="${s.id}">編輯</button>
-        <button type="button" class="btn small" data-act="dup" data-id="${s.id}">複製</button>
-        <button type="button" class="btn small" data-act="link" data-id="${s.id}">連結</button>
-        <button type="button" class="btn small danger" data-act="del" data-id="${s.id}">刪除</button>
+        <button type="button" class="btn small primary" data-act="detail" data-id="${c.id}">管理名單／座位</button>
+        <button type="button" class="btn small" data-act="toggle" data-id="${c.id}">${c.open ? '關閉劃位' : '開放劃位'}</button>
+        <button type="button" class="btn small" data-act="edit" data-id="${c.id}">編輯</button>
+        <button type="button" class="btn small" data-act="dup" data-id="${c.id}">複製</button>
+        <button type="button" class="btn small danger" data-act="del" data-id="${c.id}">刪除</button>
       </div>
     </div>`).join('');
 
   box.querySelectorAll('button[data-act]').forEach((b) => b.addEventListener('click', () => {
-    const s = state.sessions.find((x) => x.id === b.dataset.id);
-    if (!s) return;
-    ({ detail: openDetail, toggle: toggleOpen, edit: (x) => openEditor(x, false),
-       dup: (x) => openEditor(x, true), link: copyLink, del: deleteSession })[b.dataset.act](s);
+    const c = state.classes.find((x) => x.id === b.dataset.id);
+    if (!c) return;
+    ({ detail: (x) => openDetail(x.id), toggle: toggleOpen, edit: (x) => openEditor(x, false),
+       dup: (x) => openEditor(x, true), del: deleteClass })[b.dataset.act](c);
   }));
 
-  state.sessions.forEach(async (s) => {
+  list.forEach(async (c) => {
     try {
-      const snap = await getCountFromServer(collection(db, 'sessions', s.id, 'seats'));
-      const el = box.querySelector(`.cnt[data-sid="${s.id}"]`);
-      if (el) el.textContent = snap.data().count;
+      const [r, h] = await Promise.all([
+        getCountFromServer(collection(db, 'classes', c.id, 'roster')),
+        getCountFromServer(collection(db, 'classes', c.id, 'holders'))
+      ]);
+      const er = box.querySelector(`.cnt-roster[data-cid="${c.id}"]`);
+      const eh = box.querySelector(`.cnt-held[data-cid="${c.id}"]`);
+      if (er) er.textContent = r.data().count;
+      if (eh) eh.textContent = h.data().count;
     } catch (e) { console.warn(e); }
   });
 }
 
-async function toggleOpen(s) {
+async function toggleOpen(c) {
   try {
-    await updateDoc(doc(db, 'sessions', s.id), { open: !s.open, updatedAt: serverTimestamp() });
-    toast(s.open ? '已關閉劃位' : '已開放劃位', 'success');
+    await updateDoc(doc(db, 'classes', c.id), { open: !c.open, updatedAt: serverTimestamp() });
+    toast(c.open ? '已關閉劃位' : '已開放劃位', 'success');
   } catch (err) {
     console.error(err);
     toast('更新失敗：' + err.code, 'error');
   }
 }
 
-function bookingLink(sid) {
-  const base = location.href.replace(/admin\.html.*$/, '').replace(/#.*$/, '');
-  return `${base}index.html#s=${sid}`;
-}
-
-async function copyLink(s) {
-  const url = bookingLink(s.id);
+$('btn-copy-site').addEventListener('click', async () => {
+  const url = location.href.replace(/admin\.html.*$/, '').replace(/#.*$/, '');
   try {
     await navigator.clipboard.writeText(url);
-    toast('已複製劃位連結', 'success');
+    toast('已複製家長劃位網址', 'success');
   } catch (e) {
-    prompt('請複製以下連結：', url);
+    prompt('請複製以下網址：', url);
   }
-}
+});
 
-async function deleteSession(s) {
-  if (!confirm(`確定要刪除「${s.title}」？\n所有劃位資料都會一起刪除，無法復原。`)) return;
+async function deleteClass(c) {
+  if (!confirm(`確定要刪除「${c.title}」？\n學生名單和所有座位都會一起刪除，無法復原。`)) return;
   try {
-    for (const sub of ['seats', 'bookings', 'phones']) {
-      const snap = await getDocs(collection(db, 'sessions', s.id, sub));
-      for (let i = 0; i < snap.docs.length; i += 450) {
-        const batch = writeBatch(db);
-        snap.docs.slice(i, i + 450).forEach((d) => batch.delete(d.ref));
-        await batch.commit();
-      }
+    const roster = await getDocs(collection(db, 'classes', c.id, 'roster'));
+    const ops = roster.docs.map((d) => (b) => b.set(doc(db, 'students', d.id), { classes: arrayRemove(c.id) }, { merge: true }));
+    for (const sub of ['seats', 'bookings', 'holders', 'roster']) {
+      const snap = sub === 'roster' ? roster : await getDocs(collection(db, 'classes', c.id, sub));
+      snap.docs.forEach((d) => ops.push((b) => b.delete(d.ref)));
     }
-    const batch = writeBatch(db);
-    batch.delete(doc(db, 'sessions', s.id));
-    await batch.commit();
-    toast('已刪除場次', 'success');
+    ops.push((b) => b.delete(doc(db, 'classes', c.id)));
+    await commitInChunks(ops);
+    toast('已刪除班級', 'success');
   } catch (err) {
     console.error(err);
     toast('刪除失敗：' + err.code, 'error');
@@ -195,20 +212,21 @@ $('e-branch').innerHTML = ['<option value="">（不指定）</option>']
 
 $('btn-new').addEventListener('click', () => openEditor(null, false));
 
-function openEditor(s, duplicate) {
-  state.editingId = s && !duplicate ? s.id : null;
-  $('editor-title').textContent = !s ? '新增場次' : duplicate ? '複製場次（另存為新場次）' : '編輯場次';
-  $('e-title').value = s ? s.title + (duplicate ? '（複製）' : '') : '';
-  $('e-branch').value = s?.branch || '';
-  $('e-room').value = s?.room || '';
-  $('e-date').value = s?.date || '';
-  $('e-time').value = s?.time || '';
-  $('e-note').value = s?.note || '';
-  $('e-rows').value = s?.rows || 6;
-  $('e-cols').value = s?.cols || 8;
-  $('e-aisles').value = (s?.aisles || []).join(', ');
-  $('e-open').checked = s && !duplicate ? !!s.open : false;
-  state.disabled = new Set(s?.disabled || []);
+function openEditor(c, duplicate) {
+  state.editingId = c && !duplicate ? c.id : null;
+  state.dupFrom = c && duplicate ? c.id : null;
+  $('editor-title').textContent = !c ? '新增班級' : duplicate ? '複製班級（另存為新班級）' : '編輯班級';
+  $('e-title').value = c ? c.title + (duplicate ? '（複製）' : '') : '';
+  $('e-term').value = c?.term || '';
+  $('e-schedule').value = c?.schedule || '';
+  $('e-branch').value = c?.branch || $('f-branch').value || '';
+  $('e-room').value = c?.room || '';
+  $('e-note').value = c?.note || '';
+  $('e-rows').value = c?.rows || 6;
+  $('e-cols').value = c?.cols || 8;
+  $('e-aisles').value = (c?.aisles || []).join(', ');
+  $('e-open').checked = c && !duplicate ? !!c.open : false;
+  state.disabled = new Set(c?.disabled || []);
   renderPreview();
   show('view-editor');
 }
@@ -243,36 +261,43 @@ $('editor-form').addEventListener('submit', async (e) => {
 
   const data = {
     title: $('e-title').value.trim(),
+    term: $('e-term').value.trim(),
+    schedule: $('e-schedule').value.trim(),
     branch: $('e-branch').value,
     room: $('e-room').value.trim(),
-    date: $('e-date').value,
-    time: $('e-time').value.trim(),
     note: $('e-note').value.trim(),
     ...layout,
     open: $('e-open').checked,
     updatedAt: serverTimestamp()
   };
-  if (!data.title || !data.date) return toast('請填寫場次名稱與日期', 'error');
+  if (!data.title) return toast('請填寫班級名稱', 'error');
 
   const btn = $('e-submit');
   btn.disabled = true;
   try {
     if (state.editingId) {
       // 已被劃走的座位不能被刪掉
-      const snap = await getDocs(collection(db, 'sessions', state.editingId, 'seats'));
+      const snap = await getDocs(collection(db, 'classes', state.editingId, 'seats'));
       const valid = new Set(layout.seats);
       const lost = snap.docs.map((d) => d.id).filter((id) => !valid.has(id));
       if (lost.length) {
-        toast(`以下座位已有人劃位，不能移除：${lost.join('、')}`, 'error');
+        toast(`以下座位已有學生，不能移除：${lost.sort(seatOrder).join('、')}`, 'error');
         return;
       }
-      await updateDoc(doc(db, 'sessions', state.editingId), data);
+      await updateDoc(doc(db, 'classes', state.editingId), data);
+      toast('已儲存', 'success');
+      show('view-list');
     } else {
-      const ref = doc(collection(db, 'sessions'));
+      const ref = doc(collection(db, 'classes'));
       await setDoc(ref, { ...data, createdAt: serverTimestamp() });
+      // 複製班級時，可選擇一起複製學生名單（例如下學期續班）
+      if (state.dupFrom && confirm('要一起複製原班級的學生名單嗎？\n（只複製名單，不複製座位）')) {
+        const roster = await getDocs(collection(db, 'classes', state.dupFrom, 'roster'));
+        await commitInChunks(roster.docs.flatMap((d) => addStudentOps(ref.id, d.data().name, d.data().phone)));
+      }
+      toast('已建立班級，接著加入學生名單', 'success');
+      openDetail(ref.id);
     }
-    toast('已儲存', 'success');
-    show('view-list');
   } catch (err) {
     console.error(err);
     toast('儲存失敗：' + err.code, 'error');
@@ -281,25 +306,34 @@ $('editor-form').addEventListener('submit', async (e) => {
   }
 });
 
-// ---------- 名單 ----------
-function openDetail(s) {
+// ---------- 班級管理（名單＋座位） ----------
+function openDetail(cid) {
   stopDetail();
-  state.detail = s;
-  state.detailSeats = new Map();
-  state.detailBookings = [];
+  state.cid = cid;
+  state.detail = state.classes.find((c) => c.id === cid) || null;
+  state.roster = new Map();
+  state.holders = new Map();
+  state.seats = new Map();
+  $('d-import').value = '';
+  updateImportPreview();
   show('view-detail');
 
-  state.detailUnsubs.push(onSnapshot(doc(db, 'sessions', s.id), (snap) => {
+  const sub = (name) => collection(db, 'classes', cid, name);
+  state.detailUnsubs.push(onSnapshot(doc(db, 'classes', cid), (snap) => {
     if (!snap.exists()) return backToList();
     state.detail = { id: snap.id, ...snap.data() };
     renderDetail();
   }));
-  state.detailUnsubs.push(onSnapshot(collection(db, 'sessions', s.id, 'seats'), (snap) => {
-    state.detailSeats = new Map(snap.docs.map((d) => [d.id, d.data()]));
+  state.detailUnsubs.push(onSnapshot(sub('roster'), (snap) => {
+    state.roster = new Map(snap.docs.map((d) => [d.id, d.data()]));
     renderDetail();
   }));
-  state.detailUnsubs.push(onSnapshot(collection(db, 'sessions', s.id, 'bookings'), (snap) => {
-    state.detailBookings = snap.docs.map((d) => ({ uid: d.id, ...d.data() }));
+  state.detailUnsubs.push(onSnapshot(sub('holders'), (snap) => {
+    state.holders = new Map(snap.docs.map((d) => [d.id, d.data()]));
+    renderDetail();
+  }));
+  state.detailUnsubs.push(onSnapshot(sub('seats'), (snap) => {
+    state.seats = new Map(snap.docs.map((d) => [d.id, d.data()]));
     renderDetail();
   }));
 }
@@ -307,84 +341,87 @@ function openDetail(s) {
 function stopDetail() {
   state.detailUnsubs.forEach((u) => u());
   state.detailUnsubs = [];
+  state.cid = null;
   state.detail = null;
 }
 
-function seatOrder(a, b) {
-  const ra = a.charCodeAt(0), rb = b.charCodeAt(0);
-  return ra !== rb ? ra - rb : parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10);
-}
-
-function fmtTime(ts) {
-  if (!ts?.toDate) return '';
-  const d = ts.toDate();
-  const p = (n) => String(n).padStart(2, '0');
-  return `${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
-
 function renderDetail() {
-  const s = state.detail;
-  if (!s) return;
-  $('d-title').textContent = s.title;
-  $('d-meta').textContent = [formatDate(s.date) + ' ' + (s.time || ''), s.branch, s.room].filter(Boolean).join('・');
-  $('d-stat').innerHTML = `<span class="badge ${s.open ? 'on' : 'off'}">${s.open ? '開放中' : '未開放'}</span>
-    已劃 <b>${state.detailSeats.size}</b> / ${s.seats?.length || 0} 位`;
-  $('d-toggle').textContent = s.open ? '關閉劃位' : '開放劃位';
+  const c = state.detail;
+  if (!c) return;
+  $('d-title').textContent = c.title;
+  $('d-meta').textContent = classMeta(c);
+  $('d-toggle').textContent = c.open ? '關閉劃位' : '開放劃位';
 
-  const bySeat = new Map(state.detailBookings.map((b) => [b.seatId, b]));
-  renderSeatMap($('d-map'), s, (id) => {
-    if (!state.detailSeats.has(id)) return { state: 'available' };
-    const b = bySeat.get(id);
-    return { state: 'taken', label: b ? b.name.slice(0, 3) : id, title: b ? `${id} ${b.name} ${b.phone}` : id };
+  const total = state.roster.size;
+  const held = [...state.holders.keys()].filter((k) => state.roster.has(k)).length;
+  $('d-stat').innerHTML = `<span class="badge ${c.open ? 'on' : 'off'}">${c.open ? '開放劃位中' : '未開放'}</span>
+    學生 <b>${total}</b> 人・已劃位 <b>${held}</b>・<span class="${total - held ? 'warn' : ''}">未劃位 <b>${total - held}</b></span>
+    ・座位 ${c.seats?.length || 0}`;
+
+  // 座位圖：座位 -> 學生
+  const seatToKey = new Map([...state.holders].map(([k, h]) => [h.seatId, k]));
+  renderSeatMap($('d-map'), c, (id) => {
+    if (!state.seats.has(id)) return { state: 'available' };
+    const key = seatToKey.get(id);
+    const s = key && state.roster.get(key);
+    return { state: 'taken', label: s ? s.name.slice(0, 3) : '?', title: s ? `${id} ${s.name} ${s.phone}` : `${id}（無對應學生）` };
   }, (id, seatState) => {
+    if (seatState === 'available') return openAssign(id);
     if (seatState !== 'taken') return;
-    const b = bySeat.get(id);
-    if (b) adminCancel(b); else releaseSeat(id);
+    const key = seatToKey.get(id);
+    if (key) cancelStudentSeat(key);
+    else releaseOrphanSeat(id);
   });
 
-  const rows = [...state.detailBookings].sort((a, b) => seatOrder(a.seatId, b.seatId));
-  $('d-rows').innerHTML = rows.length ? rows.map((b) => `
+  // 名單
+  $('d-roster-count').textContent = `（${total} 人）`;
+  const onlyTodo = $('d-only-todo').checked;
+  const rows = [...state.roster]
+    .map(([key, s]) => ({ key, ...s, holder: state.holders.get(key) }))
+    .filter((r) => !onlyTodo || !r.holder)
+    .sort((a, b) => (a.holder ? 1 : 0) - (b.holder ? 1 : 0) || a.name.localeCompare(b.name, 'zh-Hant'));
+  $('d-rows').innerHTML = rows.length ? rows.map((r) => `
     <tr>
-      <td><span class="seat-tag">${escapeHtml(b.seatId)}</span></td>
-      <td>${escapeHtml(b.name)}</td>
-      <td>${escapeHtml(b.phone)}</td>
-      <td class="muted small">${escapeHtml(fmtTime(b.bookedAt))}</td>
-      <td><button type="button" class="btn small danger" data-uid="${escapeHtml(b.uid)}">取消</button></td>
-    </tr>`).join('') : '<tr><td colspan="5" class="muted center">尚無人劃位</td></tr>';
+      <td>${escapeHtml(r.name)}</td>
+      <td>${escapeHtml(r.phone)}</td>
+      <td>${r.holder ? `<span class="seat-tag">${escapeHtml(r.holder.seatId)}</span>` : '<span class="status todo">未劃位</span>'}</td>
+      <td class="nowrap">
+        ${r.holder ? `<button type="button" class="btn small" data-cancel="${escapeHtml(r.key)}">取消座位</button>` : ''}
+        <button type="button" class="btn small danger" data-remove="${escapeHtml(r.key)}">移出</button>
+      </td>
+    </tr>`).join('')
+    : `<tr><td colspan="4" class="muted center">${total ? '全部學生都劃好位了 🎉' : '還沒有學生，請在右邊加入名單'}</td></tr>`;
 
-  $('d-rows').querySelectorAll('button[data-uid]').forEach((btn) => btn.addEventListener('click', () => {
-    const b = state.detailBookings.find((x) => x.uid === btn.dataset.uid);
-    if (b) adminCancel(b);
-  }));
+  $('d-rows').querySelectorAll('[data-cancel]').forEach((b) => b.addEventListener('click', () => cancelStudentSeat(b.dataset.cancel)));
+  $('d-rows').querySelectorAll('[data-remove]').forEach((b) => b.addEventListener('click', () => removeStudent(b.dataset.remove)));
 }
 
+$('d-only-todo').addEventListener('change', renderDetail);
 $('d-toggle').addEventListener('click', () => state.detail && toggleOpen(state.detail));
-$('d-copy').addEventListener('click', () => state.detail && copyLink(state.detail));
 $('d-export').addEventListener('click', exportCsv);
 
-async function adminCancel(b) {
-  const s = state.detail;
-  if (!confirm(`確定取消 ${b.seatId} ${b.name} 的劃位？`)) return;
+async function cancelStudentSeat(key) {
+  const s = state.roster.get(key);
+  const h = state.holders.get(key);
+  if (!h) return;
+  if (!confirm(`確定取消 ${s ? s.name : ''} 的座位 ${h.seatId}？`)) return;
   try {
-    const batch = writeBatch(db);
-    batch.delete(doc(db, 'sessions', s.id, 'seats', b.seatId));
-    batch.delete(doc(db, 'sessions', s.id, 'bookings', b.uid));
-    batch.delete(doc(db, 'sessions', s.id, 'phones', b.phone));
-    await batch.commit();
-    toast('已取消', 'success');
+    await releaseSeat(state.cid, key, h);
+    toast('已取消座位', 'success');
   } catch (err) {
     console.error(err);
     toast('取消失敗：' + err.code, 'error');
   }
 }
 
-// 座位被佔用但沒有對應的劃位資料時（例如手動在 Console 改過資料），讓管理員可以直接釋放
-async function releaseSeat(seatId) {
-  const s = state.detail;
-  if (!confirm(`${seatId} 沒有對應的劃位資料，要直接釋放這個座位嗎？`)) return;
+// 座位被佔用但找不到對應學生時，讓管理員直接釋放
+async function releaseOrphanSeat(seatId) {
+  if (!confirm(`${seatId} 找不到對應的學生，要直接釋放這個座位嗎？`)) return;
   try {
+    const seat = state.seats.get(seatId);
     const batch = writeBatch(db);
-    batch.delete(doc(db, 'sessions', s.id, 'seats', seatId));
+    batch.delete(doc(db, 'classes', state.cid, 'seats', seatId));
+    if (seat?.bid) batch.delete(doc(db, 'classes', state.cid, 'bookings', seat.bid));
     await batch.commit();
     toast('已釋放座位', 'success');
   } catch (err) {
@@ -393,19 +430,143 @@ async function releaseSeat(seatId) {
   }
 }
 
-function exportCsv() {
-  const s = state.detail;
+async function removeStudent(key) {
+  const s = state.roster.get(key);
   if (!s) return;
+  const h = state.holders.get(key);
+  if (!confirm(`確定把 ${s.name} 移出這個班級？${h ? `\n他的座位 ${h.seatId} 也會一起釋放。` : ''}`)) return;
+  try {
+    if (h) await releaseSeat(state.cid, key, h);
+    const batch = writeBatch(db);
+    batch.delete(doc(db, 'classes', state.cid, 'roster', key));
+    batch.set(doc(db, 'students', key), { classes: arrayRemove(state.cid) }, { merge: true });
+    await batch.commit();
+    toast(`已移出 ${s.name}`, 'success');
+  } catch (err) {
+    console.error(err);
+    toast('移出失敗：' + err.code, 'error');
+  }
+}
+
+// ---------- 加入學生 ----------
+function parseRoster(text) {
+  const ok = [];
+  const bad = [];
+  const seen = new Set();
+  String(text || '').split(/\r?\n/).forEach((line) => {
+    const raw = line.trim();
+    if (!raw) return;
+    const tokens = raw.split(/[\t,，、;；]+|\s{2,}|\s+(?=0?9[\d-]{7,})/).map((t) => t.trim()).filter(Boolean);
+    let phone = '';
+    const rest = [];
+    tokens.forEach((t) => {
+      const digits = normalizePhone(t);
+      if (!phone && /^9\d{8}$/.test(digits)) phone = '0' + digits;        // 試算表吃掉開頭 0 的情況
+      else if (!phone && isValidPhone(digits)) phone = digits;
+      else rest.push(t);
+    });
+    const name = normalizeName(rest.join(''));
+    if (!name || !phone || name.length > 20 || /\d/.test(name)) { bad.push(raw); return; }
+    const key = studentKey(name, phone);
+    if (seen.has(key)) return;
+    seen.add(key);
+    ok.push({ key, name, phone });
+  });
+  return { ok, bad };
+}
+
+function updateImportPreview() {
+  const { ok, bad } = parseRoster($('d-import').value);
+  const fresh = ok.filter((s) => !state.roster.has(s.key));
+  const dup = ok.length - fresh.length;
+  const parts = [];
+  if (fresh.length) parts.push(`將加入 <b>${fresh.length}</b> 位`);
+  if (dup) parts.push(`${dup} 位已在名單中（略過）`);
+  if (bad.length) parts.push(`<span class="warn">無法辨識 ${bad.length} 行：${bad.slice(0, 3).map(escapeHtml).join('／')}${bad.length > 3 ? '…' : ''}</span>`);
+  $('d-import-preview').innerHTML = parts.join('・');
+  return fresh;
+}
+
+$('d-import').addEventListener('input', updateImportPreview);
+
+function addStudentOps(cid, name, phone) {
+  const key = studentKey(name, phone);
+  return [
+    (b) => b.set(doc(db, 'classes', cid, 'roster', key), { name, phone, addedAt: serverTimestamp() }),
+    (b) => b.set(doc(db, 'students', key), { name, phone, classes: arrayUnion(cid) }, { merge: true })
+  ];
+}
+
+$('d-import-btn').addEventListener('click', async () => {
+  const fresh = updateImportPreview();
+  if (!fresh.length) return toast('沒有可以加入的學生', 'error');
+  const btn = $('d-import-btn');
+  btn.disabled = true;
+  try {
+    await commitInChunks(fresh.flatMap((s) => addStudentOps(state.cid, s.name, s.phone)));
+    toast(`已加入 ${fresh.length} 位學生`, 'success');
+    $('d-import').value = '';
+    updateImportPreview();
+  } catch (err) {
+    console.error(err);
+    toast('加入失敗：' + err.code, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ---------- 後台指定座位 ----------
+function openAssign(seatId) {
+  if (!state.roster.size) return toast('請先加入學生名單', 'error');
+  state.assignSeat = seatId;
+  $('a-seat').textContent = seatId;
+  const list = [...state.roster]
+    .map(([key, s]) => ({ key, ...s, holder: state.holders.get(key) }))
+    .sort((a, b) => (a.holder ? 1 : 0) - (b.holder ? 1 : 0) || a.name.localeCompare(b.name, 'zh-Hant'));
+  $('a-student').innerHTML = list.map((s) => `
+    <option value="${escapeHtml(s.key)}">${escapeHtml(s.name)}（${s.holder ? '目前 ' + escapeHtml(s.holder.seatId) : '未劃位'}）</option>`).join('');
+  $('assign-modal').classList.remove('hidden');
+}
+
+function closeAssign() {
+  $('assign-modal').classList.add('hidden');
+  state.assignSeat = null;
+}
+
+$('a-cancel').addEventListener('click', closeAssign);
+$('assign-modal').addEventListener('click', (e) => { if (e.target.id === 'assign-modal') closeAssign(); });
+
+$('assign-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const key = $('a-student').value;
+  const s = state.roster.get(key);
+  const seatId = state.assignSeat;
+  if (!s || !seatId) return;
+  try {
+    await takeSeat(state.cid, { key, name: s.name, phone: s.phone }, seatId);
+    toast(`已把 ${s.name} 排到 ${seatId}`, 'success');
+    closeAssign();
+  } catch (err) {
+    console.error(err);
+    toast(err.message === 'SEAT_TAKEN' ? '這個位子剛被劃走了' : '指定失敗：' + (err.code || err.message), 'error');
+  }
+});
+
+// ---------- 匯出 ----------
+function exportCsv() {
+  const c = state.detail;
+  if (!c) return;
   const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const rows = [...state.detailBookings].sort((a, b) => seatOrder(a.seatId, b.seatId));
-  const lines = [['座位', '姓名', '手機', '劃位時間'].map(cell).join(',')]
+  const rows = [...state.roster]
+    .map(([key, s]) => ({ ...s, seat: state.holders.get(key)?.seatId || '' }))
+    .sort((a, b) => (!a.seat - !b.seat) || (a.seat && b.seat ? seatOrder(a.seat, b.seat) : a.name.localeCompare(b.name, 'zh-Hant')));
+  const lines = [['座位', '姓名', '家長手機'].map(cell).join(',')]
     // 手機用 ="09..." 格式，避免 Excel / Google 試算表吃掉開頭的 0
-    .concat(rows.map((b) => [cell(b.seatId), cell(b.name), `="${b.phone}"`, cell(fmtTime(b.bookedAt))].join(',')));
+    .concat(rows.map((r) => [cell(r.seat || '未劃位'), cell(r.name), `="${r.phone}"`].join(',')));
   const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `${s.date || ''}_${s.title}_劃位名單.csv`.replace(/[\\/:*?"<>|]/g, '_');
+  a.download = `${c.term ? c.term + '_' : ''}${c.title}_座位表.csv`.replace(/[\\/:*?"<>|]/g, '_');
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
-

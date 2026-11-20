@@ -1,30 +1,44 @@
 import {
   signInAnonymously, onAuthStateChanged,
-  collection, doc, onSnapshot, query, where, runTransaction, serverTimestamp,
-  writeBatch, getCountFromServer
+  collection, doc, getDoc, onSnapshot
 } from './firebase-sdk.js';
 import {
-  auth, db, configMissing, renderSeatMap, normalizePhone, escapeHtml,
-  sessionSortKey, formatDate, toast
+  auth, db, configMissing, renderSeatMap, normalizePhone, normalizeName, isValidPhone,
+  studentKey, takeSeat, releaseSeat, escapeHtml, classSort, classMeta, toast
 } from './common.js';
 
 const $ = (id) => document.getElementById(id);
+const VIEWS = ['view-login', 'view-classes', 'view-seats'];
 
 const state = {
   uid: null,
-  sessions: [],
-  current: null,        // 目前選擇的場次 { id, ...data }
-  taken: new Map(),     // seatId -> uid
-  myBooking: null,      // { seatId, name, phone }
-  selectedSeat: null,
-  unsubs: []            // 目前場次的即時監聽
+  student: null,          // { key, name, phone }
+  classIds: [],
+  classes: new Map(),     // cid -> 班級資料
+  holders: new Map(),     // cid -> { bid, seatId }（這個學生在該班的座位）
+  classUnsubs: new Map(), // cid -> [unsub, unsub]
+  studentUnsub: null,
+  currentCid: null,
+  taken: new Set(),       // 目前班級已被佔用的座位
+  seatsUnsub: null,
+  busy: false
 };
 let started = false;
+
+function show(view) {
+  VIEWS.forEach((v) => $(v).classList.toggle('hidden', v !== view));
+  window.scrollTo(0, 0);
+}
+
+function showNotice(msg, type = 'info') {
+  const n = $('notice');
+  n.textContent = msg;
+  n.className = `notice ${type}`;
+}
 
 // ---------- 啟動 ----------
 if (configMissing) {
   showNotice('尚未設定 Firebase：請依照 README 第 4 步，把設定貼到 js/firebase-config.js。', 'error');
-  $('session-list').innerHTML = '';
 } else {
   // 已有登入身分（例如同一台電腦登入過後台）就沿用，沒有才建立匿名身分
   onAuthStateChanged(auth, (user) => {
@@ -49,257 +63,276 @@ function onAuthError(err) {
 function start() {
   if (started) return;
   started = true;
-
-  // 監聽所有開放中的場次
-  onSnapshot(query(collection(db, 'sessions'), where('open', '==', true)), (snap) => {
-    state.sessions = snap.docs
-      .map((d) => ({ id: d.id, ...d.data() }))
-      .sort((a, b) => sessionSortKey(a).localeCompare(sessionSortKey(b)));
-    renderSessionList();
-  }, (err) => {
-    console.error(err);
-    showNotice('讀取場次失敗：請確認已依 README 第 3 步建立 Firestore 並發布安全規則。', 'error');
-  });
-
-  // 網址帶有 #s=場次ID 時直接打開該場次（方便把連結貼到 LINE）
-  const m = location.hash.match(/s=([\w-]+)/);
-  if (m) openSession(m[1]);
-
-  window.addEventListener('hashchange', () => {
-    const mm = location.hash.match(/s=([\w-]+)/);
-    if (mm) openSession(mm[1]); else closeSession();
-  });
-}
-
-// ---------- 場次列表 ----------
-function renderSessionList() {
-  const list = $('session-list');
-  if (!state.sessions.length) {
-    list.innerHTML = '<p class="muted">目前沒有開放劃位的場次。</p>';
-    return;
+  const last = loadSaved()[0];
+  if (last) {
+    lookupStudent(last.name, last.phone, true);
+  } else {
+    showLogin();
   }
-  list.innerHTML = state.sessions.map((s) => `
-    <a class="card session-card" href="#s=${s.id}">
-      <div class="card-main">
-        <div class="card-title">${escapeHtml(s.title)}</div>
-        <div class="muted small">${escapeHtml(formatDate(s.date))} ${escapeHtml(s.time || '')}</div>
-        <div class="muted small">${escapeHtml([s.branch, s.room].filter(Boolean).join('・'))}</div>
-      </div>
-      <div class="card-side"><span class="remain" data-sid="${s.id}">…</span></div>
-    </a>`).join('');
-
-  // 剩餘座位數（聚合查詢，每 1000 筆才算 1 次讀取）
-  state.sessions.forEach(async (s) => {
-    try {
-      const snap = await getCountFromServer(collection(db, 'sessions', s.id, 'seats'));
-      const left = (s.seats?.length || 0) - snap.data().count;
-      const el = list.querySelector(`.remain[data-sid="${s.id}"]`);
-      if (el) {
-        el.textContent = left > 0 ? `剩 ${left} 位` : '已額滿';
-        el.classList.toggle('full', left <= 0);
-      }
-    } catch (e) { console.warn(e); }
-  });
 }
 
-// ---------- 單一場次 ----------
-function openSession(sid) {
-  clearSessionListeners();
-  state.current = null;
-  state.taken = new Map();
-  state.myBooking = null;
-
-  $('view-sessions').classList.add('hidden');
-  $('view-seats').classList.remove('hidden');
-  $('s-title').textContent = '載入中…';
-  $('s-meta').textContent = '';
-  $('s-note').textContent = '';
-  $('seat-map').innerHTML = '';
-  $('my-booking').classList.add('hidden');
-  window.scrollTo(0, 0);
-
-  state.unsubs.push(onSnapshot(doc(db, 'sessions', sid), (snap) => {
-    if (!snap.exists()) {
-      $('s-title').textContent = '找不到這個場次';
-      $('seat-map').innerHTML = '';
-      return;
-    }
-    state.current = { id: snap.id, ...snap.data() };
-    renderSession();
-  }));
-
-  state.unsubs.push(onSnapshot(collection(db, 'sessions', sid, 'seats'), (snap) => {
-    state.taken = new Map(snap.docs.map((d) => [d.id, d.data().uid]));
-    renderSession();
-  }));
-
-  state.unsubs.push(onSnapshot(doc(db, 'sessions', sid, 'bookings', state.uid), (snap) => {
-    state.myBooking = snap.exists() ? snap.data() : null;
-    renderSession();
-  }, (err) => console.warn(err)));
+// ---------- 記住查詢過的學生（方便有兩個孩子的家長切換） ----------
+function loadSaved() {
+  try { return JSON.parse(localStorage.getItem('sb_students') || '[]'); } catch (e) { return []; }
+}
+function saveStudent(name, phone) {
+  const list = loadSaved().filter((s) => !(s.name === name && s.phone === phone));
+  list.unshift({ name, phone });
+  try { localStorage.setItem('sb_students', JSON.stringify(list.slice(0, 5))); } catch (e) { /* 忽略 */ }
+}
+function forgetStudent(name, phone) {
+  const list = loadSaved().filter((s) => !(s.name === name && s.phone === phone));
+  try { localStorage.setItem('sb_students', JSON.stringify(list)); } catch (e) { /* 忽略 */ }
 }
 
-function closeSession() {
-  clearSessionListeners();
-  state.current = null;
-  $('view-seats').classList.add('hidden');
-  $('view-sessions').classList.remove('hidden');
+// ---------- 1. 查詢學生 ----------
+function showLogin() {
+  stopStudent();
+  const saved = loadSaved();
+  const box = $('saved-students');
+  if (saved.length) {
+    box.innerHTML = '<p class="muted small">之前查詢過：</p>' + saved.map((s, i) => `
+      <span class="chip">
+        <button type="button" class="chip-main" data-i="${i}">${escapeHtml(s.name)}</button>
+        <button type="button" class="chip-x" data-x="${i}" aria-label="移除">×</button>
+      </span>`).join('');
+    box.classList.remove('hidden');
+    box.querySelectorAll('[data-i]').forEach((b) => b.addEventListener('click', () => {
+      const s = saved[b.dataset.i];
+      lookupStudent(s.name, s.phone);
+    }));
+    box.querySelectorAll('[data-x]').forEach((b) => b.addEventListener('click', () => {
+      const s = saved[b.dataset.x];
+      forgetStudent(s.name, s.phone);
+      showLogin();
+    }));
+  } else {
+    box.classList.add('hidden');
+  }
+  show('view-login');
 }
 
-function clearSessionListeners() {
-  state.unsubs.forEach((u) => u());
-  state.unsubs = [];
-}
-
-$('btn-back').addEventListener('click', () => {
-  history.pushState('', document.title, location.pathname + location.search);
-  closeSession();
+$('login-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const name = normalizeName($('l-name').value);
+  const phone = normalizePhone($('l-phone').value);
+  if (!name) return toast('請填寫學生姓名', 'error');
+  if (!isValidPhone(phone)) return toast('手機格式不正確，請輸入 09 開頭的 10 碼', 'error');
+  lookupStudent(name, phone);
 });
 
-function renderSession() {
-  const s = state.current;
-  if (!s) return;
+async function lookupStudent(name, phone, silent = false) {
+  const key = studentKey(name, phone);
+  const btn = $('l-submit');
+  btn.disabled = true;
+  try {
+    const snap = await getDoc(doc(db, 'students', key));
+    if (!snap.exists() || !(snap.data().classes || []).length) {
+      if (silent) return showLogin();
+      forgetStudent(name, phone);
+      toast('查不到這位學生。請確認姓名和手機與報名時相同，或聯絡櫃台。', 'error');
+      showLogin();
+      return;
+    }
+    saveStudent(name, phone);
+    state.student = { key, name, phone };
+    $('l-name').value = '';
+    $('l-phone').value = '';
+    openStudent();
+  } catch (err) {
+    console.error(err);
+    toast('查詢失敗，請稍後再試（' + (err.code || err.message) + '）', 'error');
+    showLogin();
+  } finally {
+    btn.disabled = false;
+  }
+}
 
-  $('s-title').textContent = s.title;
-  $('s-meta').textContent = [formatDate(s.date) + ' ' + (s.time || ''), s.branch, s.room].filter(Boolean).join('・');
-  $('s-note').textContent = s.note || '';
+$('btn-switch').addEventListener('click', showLogin);
 
-  const total = s.seats?.length || 0;
-  const left = total - state.taken.size;
+// ---------- 2. 班級列表 ----------
+function openStudent() {
+  stopStudent();
+  $('c-student').textContent = state.student.name;
+  $('class-list').innerHTML = '<p class="muted">載入中…</p>';
+  show('view-classes');
 
-  // 我的劃位
+  state.studentUnsub = onSnapshot(doc(db, 'students', state.student.key), (snap) => {
+    const ids = snap.exists() ? (snap.data().classes || []) : [];
+    state.classIds = ids;
+    // 新增的班級開始監聽，被移除的班級停止監聽
+    ids.forEach(watchClass);
+    [...state.classUnsubs.keys()].filter((cid) => !ids.includes(cid)).forEach(unwatchClass);
+    if (state.currentCid && !ids.includes(state.currentCid)) {
+      toast('這個班級已經不在你的名單裡了');
+      closeClass();
+    }
+    renderClassList();
+  }, (err) => console.error(err));
+}
+
+function watchClass(cid) {
+  if (state.classUnsubs.has(cid)) return;
+  const u1 = onSnapshot(doc(db, 'classes', cid), (snap) => {
+    if (snap.exists()) state.classes.set(cid, { id: cid, ...snap.data() });
+    else state.classes.delete(cid);
+    renderClassList();
+    if (state.currentCid === cid) renderSeats();
+  }, (err) => console.warn(err));
+  const u2 = onSnapshot(doc(db, 'classes', cid, 'holders', state.student.key), (snap) => {
+    if (snap.exists()) state.holders.set(cid, snap.data());
+    else state.holders.delete(cid);
+    renderClassList();
+    if (state.currentCid === cid) renderSeats();
+  }, (err) => console.warn(err));
+  state.classUnsubs.set(cid, [u1, u2]);
+}
+
+function unwatchClass(cid) {
+  (state.classUnsubs.get(cid) || []).forEach((u) => u());
+  state.classUnsubs.delete(cid);
+  state.classes.delete(cid);
+  state.holders.delete(cid);
+}
+
+function stopStudent() {
+  closeClass(true);
+  if (state.studentUnsub) state.studentUnsub();
+  state.studentUnsub = null;
+  [...state.classUnsubs.keys()].forEach(unwatchClass);
+  state.classIds = [];
+}
+
+function classStatus(c, holder) {
+  if (holder) {
+    return c.open
+      ? `<span class="status ok">座位 ${escapeHtml(holder.seatId)}</span>`
+      : `<span class="status ok">座位 ${escapeHtml(holder.seatId)}</span><div class="muted small">劃位已截止</div>`;
+  }
+  return c.open ? '<span class="status todo">尚未劃位</span>' : '<span class="status off">未開放劃位</span>';
+}
+
+function renderClassList() {
+  if (!state.student) return;
+  const list = $('class-list');
+  const classes = state.classIds.map((cid) => state.classes.get(cid)).filter(Boolean).sort(classSort);
+  if (!classes.length) {
+    list.innerHTML = state.classIds.length ? '<p class="muted">載入中…</p>' : '<p class="muted">目前沒有需要劃位的班級。</p>';
+    return;
+  }
+  list.innerHTML = classes.map((c) => `
+    <button type="button" class="card session-card" data-cid="${c.id}">
+      <div class="card-main">
+        <div class="card-title">${escapeHtml(c.title)}</div>
+        <div class="muted small">${escapeHtml(classMeta(c))}</div>
+      </div>
+      <div class="card-side">${classStatus(c, state.holders.get(c.id))}</div>
+    </button>`).join('');
+  list.querySelectorAll('[data-cid]').forEach((b) => b.addEventListener('click', () => openClass(b.dataset.cid)));
+}
+
+// ---------- 3. 座位圖 ----------
+function openClass(cid) {
+  closeClass(true);
+  state.currentCid = cid;
+  state.taken = new Set();
+  $('seat-map').innerHTML = '<p class="muted center">載入中…</p>';
+  show('view-seats');
+  renderSeats();
+  state.seatsUnsub = onSnapshot(collection(db, 'classes', cid, 'seats'), (snap) => {
+    state.taken = new Set(snap.docs.map((d) => d.id));
+    renderSeats();
+  }, (err) => console.error(err));
+}
+
+function closeClass(silent = false) {
+  if (state.seatsUnsub) state.seatsUnsub();
+  state.seatsUnsub = null;
+  state.currentCid = null;
+  if (!silent) show('view-classes');
+}
+
+$('btn-back').addEventListener('click', () => closeClass());
+
+function renderSeats() {
+  const c = state.classes.get(state.currentCid);
+  if (!c) return;
+  const holder = state.holders.get(c.id);
+
+  $('s-title').textContent = c.title;
+  $('s-meta').textContent = classMeta(c);
+  $('s-note').textContent = c.note || '';
+
   const box = $('my-booking');
-  if (state.myBooking) {
+  if (holder) {
     box.innerHTML = `
-      <div>✅ 你已劃位：<span class="seat-tag">${escapeHtml(state.myBooking.seatId)}</span>
-        <span class="muted small">（${escapeHtml(state.myBooking.name)}）</span></div>
-      ${s.open ? '<button type="button" id="btn-cancel-booking" class="btn small danger">取消劃位</button>'
+      <div>✅ ${escapeHtml(state.student.name)} 的座位：<span class="seat-tag">${escapeHtml(holder.seatId)}</span>
+        ${c.open ? '<div class="muted small">想換位置的話，直接點其他空位。</div>' : ''}</div>
+      ${c.open ? '<button type="button" id="btn-cancel-booking" class="btn small danger">取消座位</button>'
                : '<span class="muted small">劃位已截止，如需更改請聯絡櫃台</span>'}`;
-    box.classList.remove('hidden');
     const btn = $('btn-cancel-booking');
-    if (btn) btn.onclick = cancelBooking;
-  } else if (!s.open) {
-    box.innerHTML = '<div>⛔ 這個場次目前未開放劃位。</div>';
-    box.classList.remove('hidden');
+    if (btn) btn.onclick = cancelSeat;
+  } else if (!c.open) {
+    box.innerHTML = '<div>⛔ 這個班級目前未開放劃位。</div>';
   } else {
-    box.innerHTML = `<div>剩餘 <b>${left}</b> / ${total} 位，點選空位劃位。</div>`;
-    box.classList.remove('hidden');
+    const left = (c.seats?.length || 0) - state.taken.size;
+    box.innerHTML = `<div>請為 <b>${escapeHtml(state.student.name)}</b> 選一個整學期的固定座位（剩 ${left} 位）。</div>`;
   }
 
-  renderSeatMap($('seat-map'), s, (id) => {
-    if (state.myBooking?.seatId === id) return { state: 'mine' };
+  renderSeatMap($('seat-map'), c, (id) => {
+    if (holder?.seatId === id) return { state: 'mine' };
     if (state.taken.has(id)) return { state: 'taken' };
     return { state: 'available' };
   }, onSeatClick);
 }
 
-function onSeatClick(id, seatState) {
-  const s = state.current;
-  if (!s) return;
+async function onSeatClick(id, seatState) {
+  const c = state.classes.get(state.currentCid);
+  if (!c || state.busy) return;
   if (seatState === 'mine') return;
-  if (seatState === 'taken') return toast('這個位子已經被劃走了');
+  if (seatState === 'taken') return toast('這個位子已經有人了');
   if (seatState !== 'available') return;
-  if (!s.open) return toast('這個場次目前未開放劃位');
-  if (state.myBooking) return toast(`你已經劃了 ${state.myBooking.seatId}，要換位請先取消劃位`);
-  openModal(id);
-}
+  if (!c.open) return toast('這個班級目前未開放劃位');
 
-// ---------- 劃位表單 ----------
-function openModal(seatId) {
-  state.selectedSeat = seatId;
-  $('m-seat').textContent = seatId;
-  $('m-session').textContent = `${state.current.title}｜${formatDate(state.current.date)} ${state.current.time || ''}`;
+  const holder = state.holders.get(c.id);
+  const msg = holder
+    ? `要把 ${state.student.name} 的座位從 ${holder.seatId} 換到 ${id} 嗎？`
+    : `確定幫 ${state.student.name} 劃 ${id} 這個座位嗎？\n（整學期固定坐這個位子）`;
+  if (!confirm(msg)) return;
+
+  state.busy = true;
   try {
-    $('f-name').value = localStorage.getItem('sb_name') || '';
-    $('f-phone').value = localStorage.getItem('sb_phone') || '';
-  } catch (e) { /* 部分瀏覽器不允許 localStorage */ }
-  $('modal').classList.remove('hidden');
-  setTimeout(() => $('f-name').focus(), 50);
-}
-
-function closeModal() {
-  $('modal').classList.add('hidden');
-  state.selectedSeat = null;
-}
-
-$('m-cancel').addEventListener('click', closeModal);
-$('modal').addEventListener('click', (e) => { if (e.target.id === 'modal') closeModal(); });
-
-$('booking-form').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const name = $('f-name').value.trim();
-  const phone = normalizePhone($('f-phone').value);
-  if (!name) return toast('請填寫學生姓名', 'error');
-  if (name.length > 20) return toast('姓名最多 20 個字', 'error');
-  if (!/^09\d{8}$/.test(phone)) return toast('手機格式不正確，請輸入 09 開頭的 10 碼', 'error');
-
-  const btn = $('m-submit');
-  btn.disabled = true;
-  btn.textContent = '劃位中…';
-  try {
-    await bookSeat(state.current.id, state.selectedSeat, name, phone);
-    try {
-      localStorage.setItem('sb_name', name);
-      localStorage.setItem('sb_phone', phone);
-    } catch (err) { /* 忽略 */ }
-    toast(`劃位成功：${state.selectedSeat}`, 'success');
-    closeModal();
+    await takeSeat(c.id, state.student, id);
+    toast(holder ? `已換到 ${id}` : `劃位成功：${id}`, 'success');
   } catch (err) {
     console.error(err);
-    toast(bookingErrorMessage(err), 'error');
-    if (err.message === 'SEAT_TAKEN') closeModal();
+    toast(seatErrorMessage(err), 'error');
   } finally {
-    btn.disabled = false;
-    btn.textContent = '確認劃位';
+    state.busy = false;
   }
-});
-
-async function bookSeat(sid, seatId, name, phone) {
-  const uid = state.uid;
-  const seatRef = doc(db, 'sessions', sid, 'seats', seatId);
-  const bookingRef = doc(db, 'sessions', sid, 'bookings', uid);
-  const phoneRef = doc(db, 'sessions', sid, 'phones', phone);
-
-  // Transaction：先確認位子還空著、自己還沒劃過，再一次寫入三份文件
-  await runTransaction(db, async (tx) => {
-    const seatSnap = await tx.get(seatRef);
-    const bookingSnap = await tx.get(bookingRef);
-    if (seatSnap.exists()) throw new Error('SEAT_TAKEN');
-    if (bookingSnap.exists()) throw new Error('ALREADY_BOOKED');
-    tx.set(seatRef, { uid, bookedAt: serverTimestamp() });
-    tx.set(bookingRef, { seatId, name, phone, bookedAt: serverTimestamp() });
-    tx.set(phoneRef, { uid });
-  });
 }
 
-function bookingErrorMessage(err) {
+function seatErrorMessage(err) {
   if (err.message === 'SEAT_TAKEN') return '手腳慢了一步，這個位子剛被劃走，請選其他位子';
-  if (err.message === 'ALREADY_BOOKED') return '你在這個場次已經劃過位子了';
-  if (err.code === 'permission-denied') return '劃位失敗：這支手機在此場次已劃過位，或劃位已截止';
+  if (err.message === 'SAME_SEAT') return '你已經坐在這個位子了';
+  if (err.code === 'permission-denied') return '劃位失敗：劃位可能已截止，或學生已不在這個班的名單中';
   if (err.code === 'unavailable') return '網路不穩，請稍後再試';
   return '劃位失敗，請稍後再試（' + (err.code || err.message) + '）';
 }
 
-async function cancelBooking() {
-  const s = state.current;
-  const b = state.myBooking;
-  if (!s || !b) return;
-  if (!confirm(`確定要取消 ${b.seatId} 的劃位嗎？`)) return;
+async function cancelSeat() {
+  const c = state.classes.get(state.currentCid);
+  const holder = c && state.holders.get(c.id);
+  if (!holder || state.busy) return;
+  if (!confirm(`確定要取消 ${state.student.name} 的座位 ${holder.seatId} 嗎？`)) return;
+  state.busy = true;
   try {
-    const batch = writeBatch(db);
-    batch.delete(doc(db, 'sessions', s.id, 'seats', b.seatId));
-    batch.delete(doc(db, 'sessions', s.id, 'bookings', state.uid));
-    batch.delete(doc(db, 'sessions', s.id, 'phones', b.phone));
-    await batch.commit();
-    toast('已取消劃位', 'success');
+    await releaseSeat(c.id, state.student.key, holder);
+    toast('已取消座位', 'success');
   } catch (err) {
     console.error(err);
     toast(err.code === 'permission-denied' ? '取消失敗：劃位可能已截止，請聯絡櫃台' : '取消失敗，請稍後再試', 'error');
+  } finally {
+    state.busy = false;
   }
-}
-
-function showNotice(msg, type = 'info') {
-  const n = $('notice');
-  n.textContent = msg;
-  n.className = `notice ${type}`;
 }

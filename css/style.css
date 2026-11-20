@@ -251,3 +251,32 @@ label.check input { width: auto; margin: 0; }
 #toast.show { opacity: 1; transform: translate(-50%, 0); }
 #toast.error { background: var(--danger); }
 #toast.success { background: var(--ok); }
+
+/* ---------- 常態班級版新增 ---------- */
+button.card { width: 100%; text-align: left; font: inherit; cursor: pointer; }
+button.card:hover { border-color: var(--brand); }
+.panel { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; }
+.panel h3 { margin: 0 0 8px; font-size: 1rem; }
+.panel .table { margin-top: 8px; border: 0; }
+.panel-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+#login-form { display: flex; flex-direction: column; gap: 14px; }
+.btn.block { width: 100%; padding: 12px; margin-top: 4px; }
+.detail-grid { display: grid; grid-template-columns: 3fr 2fr; gap: 16px; margin-top: 18px; align-items: start; }
+@media (max-width: 760px) { .detail-grid { grid-template-columns: 1fr; } }
+.detail-grid textarea { margin: 8px 0; font-size: 0.92rem; }
+.status { display: inline-block; font-size: 0.82rem; padding: 3px 10px; border-radius: 99px; white-space: nowrap; }
+.status.ok { background: #fdf0db; color: #9a6411; font-weight: 600; }
+.status.todo { background: #fbe9e7; color: #a33a32; }
+.status.off { background: #eee; color: var(--muted); }
+.card-side { text-align: right; }
+.warn { color: var(--danger); }
+.nowrap { white-space: nowrap; }
+.inline-select { width: auto; display: inline-block; margin: 0; padding: 8px 10px; font-size: 0.92rem; }
+label.check.inline { margin: 0; font-size: 0.85rem; color: var(--muted); }
+.saved { margin-top: 18px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.saved p { width: 100%; margin: 0; }
+.chip { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 99px; background: #fff; overflow: hidden; }
+.chip button { border: 0; background: none; font: inherit; cursor: pointer; padding: 6px 10px; color: var(--text); }
+.chip .chip-main { padding-right: 4px; }
+.chip .chip-x { color: var(--muted); padding-left: 4px; }
+.chip:hover { border-color: var(--brand); }
