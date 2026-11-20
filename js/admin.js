@@ -11,7 +11,7 @@ import {
 import { ADMIN_EMAILS, BRANCHES } from './firebase-config.js';
 
 const $ = (id) => document.getElementById(id);
-const VIEWS = ['view-login', 'view-denied', 'view-list', 'view-editor', 'view-detail'];
+const VIEWS = ['view-login', 'view-denied', 'view-list', 'view-editor', 'view-detail', 'view-import'];
 
 const state = {
   classes: [],
@@ -25,7 +25,9 @@ const state = {
   editingId: null,           // null = 新增
   dupFrom: null,             // 複製來源班級 ID
   disabled: new Set(),
-  assignSeat: null
+  assignSeat: null,
+  rosters: null,             // 整份匯入用：cid -> Map(key -> { name, phone })
+  plan: null                 // 整份匯入的比對結果
 };
 
 function show(view) {
@@ -569,4 +571,212 @@ function exportCsv() {
   a.download = `${c.term ? c.term + '_' : ''}${c.title}_座位表.csv`.replace(/[\\/:*?"<>|]/g, '_');
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+// ---------- 整份名冊匯入 ----------
+const normTitle = (t) => String(t || '').replace(/[\s　]/g, '').toLowerCase();
+
+$('btn-import').addEventListener('click', openImport);
+$('i-text').addEventListener('input', analyzeImport);
+$('i-term').addEventListener('change', analyzeImport);
+$('i-branch').addEventListener('change', analyzeImport);
+$('i-submit').addEventListener('click', runImport);
+$('btn-export-all').addEventListener('click', exportAllRosters);
+
+async function openImport() {
+  const terms = [...new Set(state.classes.map((c) => c.term).filter(Boolean))].sort().reverse();
+  $('i-term').innerHTML = ['<option value="">全部學期</option>']
+    .concat(terms.map((t) => `<option>${escapeHtml(t)}</option>`)).join('');
+  if (terms.length) $('i-term').value = terms[0];
+  $('i-branch').innerHTML = ['<option value="">全部分校</option>']
+    .concat(BRANCHES.map((b) => `<option>${escapeHtml(b)}</option>`)).join('');
+  $('i-branch').value = $('f-branch').value;
+  $('i-preview').classList.add('hidden');
+  show('view-import');
+  await loadAllRosters();
+  analyzeImport();
+}
+
+async function loadAllRosters() {
+  $('i-status').textContent = '讀取各班目前的名單中…';
+  const entries = await Promise.all(state.classes.map(async (c) => {
+    const snap = await getDocs(collection(db, 'classes', c.id, 'roster'));
+    return [c.id, new Map(snap.docs.map((d) => [d.id, d.data()]))];
+  }));
+  state.rosters = new Map(entries);
+  $('i-status').textContent = '';
+}
+
+function importCandidates() {
+  const term = $('i-term').value;
+  const branch = $('i-branch').value;
+  return state.classes.filter((c) => (!term || c.term === term) && (!branch || c.branch === branch));
+}
+
+// 解析貼上的名冊：每列 姓名、手機、班級（班級可用「、」分隔多個）
+function parseBulk(text) {
+  const rows = [];
+  const bad = [];
+  String(text || '').split(/\r?\n/).forEach((line) => {
+    const raw = line.trim();
+    if (!raw) return;
+    const useTab = line.includes('\t');
+    const fields = (useTab ? line.split('\t') : line.split(/[,，]/)).map((f) => f.trim()).filter(Boolean);
+    if (fields.some((f) => /^(學生)?姓名$|^(家長)?手機$|^班級$/.test(f))) return;   // 標題列
+    let phone = '';
+    const others = [];
+    fields.forEach((f) => {
+      const digits = normalizePhone(f);
+      if (!phone && /^\d[\d\s-]*$/.test(f) && /^9\d{8}$/.test(digits)) phone = '0' + digits;
+      else if (!phone && /^[\d\s-]+$/.test(f) && isValidPhone(digits)) phone = digits;
+      else others.push(f);
+    });
+    const name = normalizeName(others.shift() || '');
+    const classNames = others.join('、').split(useTab ? /[、;；\/,，]/ : /[、;；\/]/)
+      .map((t) => t.trim()).filter(Boolean);
+    if (!name || !phone || !classNames.length || name.length > 20 || /\d/.test(name)) { bad.push(raw); return; }
+    rows.push({ name, phone, key: studentKey(name, phone), classNames });
+  });
+  return { rows, bad };
+}
+
+function analyzeImport() {
+  if (!state.rosters) return;
+  const { rows, bad } = parseBulk($('i-text').value);
+  if (!rows.length && !bad.length) {
+    $('i-preview').classList.add('hidden');
+    state.plan = null;
+    return;
+  }
+
+  const byTitle = new Map();
+  importCandidates().forEach((c) => {
+    const k = normTitle(c.title);
+    byTitle.set(k, [...(byTitle.get(k) || []), c]);
+  });
+
+  const unknown = new Map();     // 班級名稱 -> 筆數
+  const ambiguous = new Map();   // 班級名稱 -> 符合的班級
+  const sheet = new Map();       // cid -> Map(key -> { name, phone })
+  rows.forEach((r) => r.classNames.forEach((title) => {
+    const matches = byTitle.get(normTitle(title)) || [];
+    if (!matches.length) unknown.set(title, (unknown.get(title) || 0) + 1);
+    else if (matches.length > 1) ambiguous.set(title, matches);
+    else {
+      const cid = matches[0].id;
+      if (!sheet.has(cid)) sheet.set(cid, new Map());
+      sheet.get(cid).set(r.key, { name: r.name, phone: r.phone });
+    }
+  }));
+
+  const plan = [...sheet].map(([cid, students]) => {
+    const c = state.classes.find((x) => x.id === cid);
+    const roster = state.rosters.get(cid) || new Map();
+    const adds = [...students].filter(([k]) => !roster.has(k)).map(([key, s]) => ({ key, ...s }));
+    const existing = [...students.keys()].filter((k) => roster.has(k)).length;
+    const missing = [...roster].filter(([k]) => !students.has(k)).map(([key, s]) => ({ key, ...s }));
+    return { cid, c, total: students.size, adds, existing, missing };
+  }).sort((a, b) => classSort(a.c, b.c));
+  state.plan = plan;
+
+  // 問題列表
+  const problems = [];
+  if (bad.length) problems.push(`<li>無法辨識 ${bad.length} 列（需要姓名、09 開頭的手機、班級）：${bad.slice(0, 5).map(escapeHtml).join('／')}${bad.length > 5 ? '…' : ''}</li>`);
+  unknown.forEach((n, title) => problems.push(`<li>找不到班級「${escapeHtml(title)}」（${n} 筆）：請確認名稱和後台一樣，或檢查上面選的學期／分校</li>`));
+  ambiguous.forEach((list, title) => problems.push(`<li>「${escapeHtml(title)}」對應到 ${list.length} 個班（${list.map((c) => escapeHtml(classMeta(c) || c.title)).join('；')}），請先選學期或分校</li>`));
+  $('i-problems').innerHTML = problems.length
+    ? `<div class="notice error"><b>這些資料不會匯入：</b><ul class="tight">${problems.join('')}</ul></div>` : '';
+
+  $('i-rows').innerHTML = plan.length ? plan.map((p) => `
+    <tr>
+      <td><b>${escapeHtml(p.c.title)}</b><div class="muted small">${escapeHtml(classMeta(p.c))}</div></td>
+      <td>${p.total}</td>
+      <td>${p.adds.length ? `<b class="ok-text">+${p.adds.length}</b>` : '0'}</td>
+      <td>${p.existing}</td>
+      <td>${p.missing.length ? `<span class="warn">${p.missing.length}</span>` : '0'}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="5" class="muted center">沒有可以對應的班級</td></tr>';
+
+  // 名冊上沒有的學生
+  const missingTotal = plan.reduce((n, p) => n + p.missing.length, 0);
+  const rm = $('i-removals');
+  if (missingTotal) {
+    rm.innerHTML = `
+      <label class="check"><input id="i-remove" type="checkbox"> 把名冊上沒有的 <b>${missingTotal}</b> 位學生移出班級（有座位的會一起釋放）</label>
+      ${plan.filter((p) => p.missing.length).map((p) => `
+        <div class="small"><b>${escapeHtml(p.c.title)}</b>：${p.missing.map((s) => escapeHtml(s.name)).join('、')}</div>`).join('')}
+      <p class="muted small">不勾的話，這些學生會留在班上。名冊裡沒出現的班級不會有任何變動。</p>`;
+    rm.classList.remove('hidden');
+  } else {
+    rm.innerHTML = '';
+    rm.classList.add('hidden');
+  }
+
+  const addTotal = plan.reduce((n, p) => n + p.adds.length, 0);
+  $('i-status').innerHTML = `共 ${rows.length} 位學生、對應到 ${plan.length} 個班，將新加入 <b>${addTotal}</b> 筆。`;
+  $('i-preview').classList.remove('hidden');
+}
+
+async function runImport() {
+  const plan = state.plan || [];
+  const doRemove = $('i-remove')?.checked;
+  const addTotal = plan.reduce((n, p) => n + p.adds.length, 0);
+  const rmTotal = doRemove ? plan.reduce((n, p) => n + p.missing.length, 0) : 0;
+  if (!addTotal && !rmTotal) return toast('沒有需要變動的資料', 'error');
+  if (!confirm(`確定匯入？\n新加入 ${addTotal} 筆${rmTotal ? `\n移出 ${rmTotal} 筆（座位一起釋放）` : ''}`)) return;
+
+  const btn = $('i-submit');
+  btn.disabled = true;
+  btn.textContent = '匯入中…';
+  try {
+    const ops = [];
+    for (const p of plan) {
+      p.adds.forEach((s) => ops.push(...addStudentOps(p.cid, s.name, s.phone)));
+      if (doRemove && p.missing.length) {
+        const holders = await getDocs(collection(db, 'classes', p.cid, 'holders'));
+        const held = new Map(holders.docs.map((d) => [d.id, d.data()]));
+        p.missing.forEach((s) => {
+          const h = held.get(s.key);
+          if (h) {
+            ops.push((b) => b.delete(doc(db, 'classes', p.cid, 'seats', h.seatId)));
+            ops.push((b) => b.delete(doc(db, 'classes', p.cid, 'bookings', h.bid)));
+            ops.push((b) => b.delete(doc(db, 'classes', p.cid, 'holders', s.key)));
+          }
+          ops.push((b) => b.delete(doc(db, 'classes', p.cid, 'roster', s.key)));
+          ops.push((b) => b.set(doc(db, 'students', s.key), { classes: arrayRemove(p.cid) }, { merge: true }));
+        });
+      }
+    }
+    await commitInChunks(ops);
+    toast(`匯入完成：新加入 ${addTotal} 筆${rmTotal ? `、移出 ${rmTotal} 筆` : ''}`, 'success');
+    await loadAllRosters();
+    analyzeImport();
+  } catch (err) {
+    console.error(err);
+    toast('匯入失敗：' + (err.code || err.message) + '。可以重新匯入一次，已加入的會自動略過。', 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '確認匯入';
+  }
+}
+
+// 把系統目前的名單匯出成「學生姓名、家長手機、班級」三欄，可以直接貼回名冊
+async function exportAllRosters() {
+  const classes = importCandidates();
+  if (!classes.length) return toast('沒有符合的班級', 'error');
+  if (!state.rosters) await loadAllRosters();
+  const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const rows = [];
+  classes.forEach((c) => (state.rosters.get(c.id) || new Map()).forEach((s) => rows.push([s.name, s.phone, c.title])));
+  rows.sort((a, b) => a[2].localeCompare(b[2], 'zh-Hant') || a[0].localeCompare(b[0], 'zh-Hant'));
+  const lines = [['學生姓名', '家長手機', '班級'].map(cell).join(',')]
+    .concat(rows.map((r) => [cell(r[0]), `="${r[1]}"`, cell(r[2])].join(',')));
+  const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  const tag = [$('i-term').value, $('i-branch').value].filter(Boolean).join('_') || '全部';
+  a.download = `學生名冊_${tag}.csv`.replace(/[\\/:*?"<>|]/g, '_');
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  toast(`已匯出 ${rows.length} 筆`, 'success');
 }
