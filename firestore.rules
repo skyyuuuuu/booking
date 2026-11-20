@@ -25,6 +25,11 @@ service cloud.firestore {
         ];
     }
 
+    // ---------- 教室座位範本：只有管理員能看、能改 ----------
+    match /rooms/{rid} {
+      allow read, write: if isAdmin();
+    }
+
     // ---------- 學生索引：這個學生上哪些班 ----------
     // 只能用完整的 key 讀單筆（等於要知道姓名＋手機），不能列出全部
     match /students/{key} {

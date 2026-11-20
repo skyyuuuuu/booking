@@ -11,7 +11,7 @@ import {
 import { ADMIN_EMAILS, BRANCHES } from './firebase-config.js';
 
 const $ = (id) => document.getElementById(id);
-const VIEWS = ['view-login', 'view-denied', 'view-list', 'view-editor', 'view-detail', 'view-import'];
+const VIEWS = ['view-login', 'view-denied', 'view-list', 'view-editor', 'view-detail', 'view-import', 'view-batch', 'view-rooms', 'view-room-editor'];
 
 const state = {
   classes: [],
@@ -26,6 +26,10 @@ const state = {
   dupFrom: null,             // 複製來源班級 ID
   disabled: new Set(),
   assignSeat: null,
+  rooms: [],                 // 教室座位範本
+  roomsUnsub: null,
+  editingRoomId: null,
+  roomDisabled: new Set(),
   rosters: null,             // 整份匯入用：cid -> Map(key -> { name, phone })
   plan: null                 // 整份匯入的比對結果
 };
@@ -105,6 +109,14 @@ $('f-branch').addEventListener('change', renderList);
 
 function startListening() {
   if (state.listUnsub) return;
+  state.roomsUnsub = onSnapshot(collection(db, 'rooms'), (snap) => {
+    state.rooms = snap.docs.map((d) => ({ id: d.id, ...d.data() }))
+      .sort((a, b) => String(a.branch || '').localeCompare(String(b.branch || '')) || String(a.name).localeCompare(String(b.name), 'zh-Hant', { numeric: true }));
+    if (!$('view-rooms').classList.contains('hidden')) renderRooms();
+  }, (err) => {
+    console.error(err);
+    showNotice('讀取教室範本失敗：請到 Firebase 重新貼上最新的 firestore.rules（記得改管理員 email）並發布。', 'error');
+  });
   state.listUnsub = onSnapshot(collection(db, 'classes'), (snap) => {
     state.classes = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort(classSort);
     renderList();
@@ -117,6 +129,8 @@ function startListening() {
 function stopListening() {
   if (state.listUnsub) state.listUnsub();
   state.listUnsub = null;
+  if (state.roomsUnsub) state.roomsUnsub();
+  state.roomsUnsub = null;
   stopDetail();
 }
 
@@ -229,9 +243,32 @@ function openEditor(c, duplicate) {
   $('e-aisles').value = (c?.aisles || []).join(', ');
   $('e-open').checked = c && !duplicate ? !!c.open : false;
   state.disabled = new Set(c?.disabled || []);
+  fillRoomTemplateOptions();
   renderPreview();
   show('view-editor');
 }
+
+function fillRoomTemplateOptions() {
+  const branch = $('e-branch').value;
+  const rooms = state.rooms.filter((r) => !branch || r.branch === branch);
+  $('e-room-template').innerHTML = [`<option value="">${rooms.length ? '（不套用，自己設定）' : branch ? '這個分校還沒有教室範本' : '還沒有教室範本'}</option>`]
+    .concat(rooms.map((r) => `<option value="${r.id}">${escapeHtml(branch ? r.name : `${r.branch}｜${r.name}`)}（${r.rows}×${r.cols}，${r.seats?.length || 0} 位）</option>`))
+    .join('');
+}
+
+$('e-branch').addEventListener('change', fillRoomTemplateOptions);
+$('e-room-template').addEventListener('change', () => {
+  const r = state.rooms.find((x) => x.id === $('e-room-template').value);
+  if (!r) return;
+  if (!$('e-branch').value) $('e-branch').value = r.branch || '';
+  $('e-room').value = r.name;
+  $('e-rows').value = r.rows;
+  $('e-cols').value = r.cols;
+  $('e-aisles').value = (r.aisles || []).join(', ');
+  state.disabled = new Set(r.disabled || []);
+  renderPreview();
+  toast(`已套用「${r.name}」的座位`, 'success');
+});
 
 function readLayout() {
   const rows = Math.min(26, Math.max(1, parseInt($('e-rows').value, 10) || 1));
@@ -401,6 +438,14 @@ function renderDetail() {
 $('d-only-todo').addEventListener('change', renderDetail);
 $('d-toggle').addEventListener('click', () => state.detail && toggleOpen(state.detail));
 $('d-export').addEventListener('click', exportCsv);
+$('d-print').addEventListener('click', () => $('print-modal').classList.remove('hidden'));
+$('p-cancel').addEventListener('click', () => $('print-modal').classList.add('hidden'));
+$('print-modal').addEventListener('click', (e) => { if (e.target.id === 'print-modal') $('print-modal').classList.add('hidden'); });
+$('print-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  $('print-modal').classList.add('hidden');
+  printSeatChart({ view: $('p-view').value, withList: $('p-list').checked, withPhone: $('p-phone').checked });
+});
 
 async function cancelStudentSeat(key) {
   const s = state.roster.get(key);
@@ -779,4 +824,395 @@ async function exportAllRosters() {
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   toast(`已匯出 ${rows.length} 筆`, 'success');
+}
+
+// ---------- 批次建立班級 ----------
+$('btn-batch').addEventListener('click', openBatch);
+$('b-text').addEventListener('input', analyzeBatch);
+['b-rows', 'b-cols', 'b-aisles'].forEach((id) => $(id).addEventListener('input', analyzeBatch));
+$('b-template').addEventListener('change', () => { syncTemplateInputs(); analyzeBatch(); });
+$('b-submit').addEventListener('click', runBatch);
+
+let batchPlan = [];
+
+function openBatch() {
+  const roomOpts = state.rooms.map((r) => `<option value="room:${r.id}">教室範本：${escapeHtml(r.branch || '')}｜${escapeHtml(r.name)}（${r.rows}×${r.cols}，${r.seats?.length || 0} 位）</option>`).join('');
+  const classOpts = state.classes.map((c) => `<option value="class:${c.id}">「${escapeHtml(c.title)}」的座位（${escapeHtml(classMeta(c) || '')}｜${c.rows}×${c.cols}，${c.seats?.length || 0} 位）</option>`).join('');
+  $('b-template').innerHTML = '<option value="">使用下面的排數、每排座位數、走道</option>'
+    + (roomOpts ? `<optgroup label="套用教室範本">${roomOpts}</optgroup>` : '')
+    + (classOpts ? `<optgroup label="套用現有班級的座位">${classOpts}</optgroup>` : '');
+  syncTemplateInputs();
+  $('b-preview').classList.add('hidden');
+  $('b-status').textContent = '';
+  show('view-batch');
+  analyzeBatch();
+}
+
+function batchTemplate() {
+  const [kind, id] = String($('b-template').value).split(':');
+  if (kind === 'room') {
+    const r = state.rooms.find((x) => x.id === id);
+    return r ? { ...r, label: `教室範本「${r.branch ? r.branch + ' ' : ''}${r.name}」` } : null;
+  }
+  if (kind === 'class') {
+    const c = state.classes.find((x) => x.id === id);
+    return c ? { ...c, label: `套用「${c.title}」` } : null;
+  }
+  return null;
+}
+
+function syncTemplateInputs() {
+  const t = batchTemplate();
+  ['b-rows', 'b-cols', 'b-aisles'].forEach((id) => { $(id).disabled = !!t; });
+  if (t) {
+    $('b-rows').value = t.rows;
+    $('b-cols').value = t.cols;
+    $('b-aisles').value = (t.aisles || []).join(', ');
+  }
+}
+
+function layoutFrom(t, label) {
+  return { rows: t.rows, cols: t.cols, aisles: [...(t.aisles || [])], disabled: [...(t.disabled || [])], seats: [...(t.seats || [])], from: label };
+}
+
+function defaultLayout() {
+  const t = batchTemplate();
+  if (t) return layoutFrom(t, t.label);
+  const rows = parseInt($('b-rows').value, 10);
+  const cols = parseInt($('b-cols').value, 10);
+  return makeLayout(rows, cols, parseNumberList($('b-aisles').value));
+}
+
+function makeLayout(rows, cols, aisles) {
+  if (!(rows >= 1 && rows <= 26 && cols >= 1 && cols <= 30)) return null;
+  const a = aisles.filter((n) => n < cols);
+  return { rows, cols, aisles: a, disabled: [], seats: buildSeatList(rows, cols), from: '' };
+}
+
+function parseBatch(text) {
+  const rows = [];
+  String(text || '').split(/\r?\n/).forEach((line) => {
+    if (!line.trim()) return;
+    const f = (line.includes('\t') ? line.split('\t') : line.split(/[,，]/)).map((x) => x.trim());
+    if (f[0] === '班級名稱') return;   // 標題列
+    rows.push({
+      raw: line.trim(),
+      title: f[0] || '', term: f[1] || '', schedule: f[2] || '', branch: f[3] || '', room: f[4] || '',
+      rowsText: f[5] || '', colsText: f[6] || '', aislesText: f[7] || ''
+    });
+  });
+  return rows;
+}
+
+function analyzeBatch() {
+  const parsed = parseBatch($('b-text').value);
+  if (!parsed.length) {
+    $('b-preview').classList.add('hidden');
+    $('b-status').textContent = '';
+    batchPlan = [];
+    return;
+  }
+  const keyOf = (title, term, branch) => `${normTitle(title)}|${String(term).trim()}|${String(branch).trim()}`;
+  const existing = new Set(state.classes.map((c) => keyOf(c.title, c.term || '', c.branch || '')));
+  const seen = new Set();
+  const base = defaultLayout();
+  const unknownBranches = new Set();
+
+  batchPlan = parsed.map((r) => {
+    const item = { ...r, status: 'ok', note: '' };
+    if (!r.title) { item.status = 'skip'; item.note = '缺少班級名稱'; return item; }
+    if (r.title.length > 60) { item.status = 'skip'; item.note = '班級名稱太長'; return item; }
+    const k = keyOf(r.title, r.term, r.branch);
+    if (existing.has(k)) { item.status = 'skip'; item.note = '已經有這個班級，略過'; return item; }
+    if (seen.has(k)) { item.status = 'skip'; item.note = '清單裡重複，略過'; return item; }
+    seen.add(k);
+
+    const override = r.rowsText || r.colsText || r.aislesText;
+    let layout;
+    if (override) {
+      const rowsN = r.rowsText ? parseInt(r.rowsText, 10) : parseInt($('b-rows').value, 10);
+      const colsN = r.colsText ? parseInt(r.colsText, 10) : parseInt($('b-cols').value, 10);
+      layout = makeLayout(rowsN, colsN, r.aislesText ? parseNumberList(r.aislesText) : parseNumberList($('b-aisles').value));
+      if (!layout) { item.status = 'skip'; item.note = '排數要 1～26、每排座位數要 1～30'; return item; }
+    } else {
+      // 分校＋教室對得上教室範本的，優先用範本
+      const room = r.room && state.rooms.find((x) => normTitle(x.name) === normTitle(r.room) && (!r.branch || x.branch === r.branch));
+      layout = room ? layoutFrom(room, `教室範本「${room.branch ? room.branch + ' ' : ''}${room.name}」`) : base;
+      if (!layout) { item.status = 'skip'; item.note = '預設座位的排數或座位數不正確'; return item; }
+    }
+    item.layout = layout;
+    if (r.branch && !BRANCHES.includes(r.branch)) {
+      unknownBranches.add(r.branch);
+      item.note = '分校名稱不在清單中（仍會建立）';
+    }
+    return item;
+  });
+
+  const okCount = batchPlan.filter((x) => x.status === 'ok').length;
+  const problems = [];
+  if (unknownBranches.size) {
+    problems.push(`<li>分校名稱「${[...unknownBranches].map(escapeHtml).join('」「')}」不在分校清單裡。班級仍會建立，但用分校篩選時會找不到，建議改成清單裡的名稱：${BRANCHES.map(escapeHtml).join('、')}</li>`);
+  }
+  $('b-problems').innerHTML = problems.length ? `<div class="notice error"><ul class="tight">${problems.join('')}</ul></div>` : '';
+
+  $('b-rows-preview').innerHTML = batchPlan.map((x) => `
+    <tr class="${x.status === 'skip' ? 'muted' : ''}">
+      <td><b>${escapeHtml(x.title || '（空白）')}</b></td>
+      <td>${escapeHtml(x.term)}</td>
+      <td>${escapeHtml(x.schedule)}</td>
+      <td>${escapeHtml(x.branch)}</td>
+      <td>${escapeHtml(x.room)}</td>
+      <td class="nowrap">${x.layout ? `${x.layout.rows}×${x.layout.cols}，${x.layout.seats.length} 位${x.layout.aisles.length ? `<div class="muted small">走道：${x.layout.aisles.join(', ')}</div>` : ''}${x.layout.from ? `<div class="muted small">${escapeHtml(x.layout.from)}</div>` : ''}` : ''}</td>
+      <td>${x.status === 'ok'
+        ? `<span class="status ok">將建立</span>${x.note ? `<div class="warn small">${escapeHtml(x.note)}</div>` : ''}`
+        : `<span class="status off">${escapeHtml(x.note)}</span>`}</td>
+    </tr>`).join('');
+
+  $('b-status').innerHTML = `共 ${batchPlan.length} 列，將建立 <b>${okCount}</b> 個班級。`;
+  $('b-submit').disabled = !okCount;
+  $('b-preview').classList.remove('hidden');
+}
+
+async function runBatch() {
+  const items = batchPlan.filter((x) => x.status === 'ok');
+  if (!items.length) return toast('沒有可以建立的班級', 'error');
+  if (!confirm(`確定建立 ${items.length} 個班級？\n（建立後都是「未開放」，加好學生名單再開放劃位）`)) return;
+  const btn = $('b-submit');
+  btn.disabled = true;
+  btn.textContent = '建立中…';
+  try {
+    await commitInChunks(items.map((x) => (b) => {
+      const { rows, cols, aisles, disabled, seats } = x.layout;
+      b.set(doc(collection(db, 'classes')), {
+        title: x.title, term: x.term, schedule: x.schedule, branch: x.branch, room: x.room, note: '',
+        rows, cols, aisles, disabled, seats, open: false,
+        createdAt: serverTimestamp(), updatedAt: serverTimestamp()
+      });
+    }));
+    toast(`已建立 ${items.length} 個班級，接著可以用「整份名冊匯入」加入學生`, 'success');
+    $('b-text').value = '';
+    show('view-list');
+  } catch (err) {
+    console.error(err);
+    toast('建立失敗：' + (err.code || err.message) + '。可以再按一次，已建立的會自動略過。', 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '確認建立';
+  }
+}
+
+// ---------- 教室座位範本 ----------
+$('btn-rooms').addEventListener('click', openRooms);
+$('btn-new-room').addEventListener('click', () => openRoomEditor(null, false));
+document.querySelectorAll('.js-back-rooms').forEach((b) => b.addEventListener('click', openRooms));
+$('r-branch-filter').addEventListener('change', renderRooms);
+['r-rows', 'r-cols', 'r-aisles'].forEach((id) => $(id).addEventListener('input', renderRoomPreview));
+
+function openRooms() {
+  if (!$('r-branch-filter').options.length) {
+    $('r-branch-filter').innerHTML = ['<option value="">全部分校</option>']
+      .concat(BRANCHES.map((b) => `<option>${escapeHtml(b)}</option>`)).join('');
+    $('r-branch-filter').value = $('f-branch').value;
+  }
+  renderRooms();
+  show('view-rooms');
+}
+
+function renderRooms() {
+  const branch = $('r-branch-filter').value;
+  const list = state.rooms.filter((r) => !branch || r.branch === branch);
+  const box = $('room-list');
+  if (!list.length) {
+    box.innerHTML = `<p class="muted">${state.rooms.length ? '這個分校還沒有教室範本。' : '還沒有教室範本，按「新增教室」開始。'}</p>`;
+    return;
+  }
+  box.innerHTML = list.map((r) => {
+    const used = state.classes.filter((c) => c.branch === r.branch && normTitle(c.room) === normTitle(r.name)).length;
+    return `
+    <div class="card admin-card">
+      <div class="card-main">
+        <div class="card-title">${escapeHtml(r.name)} <span class="muted small">${escapeHtml(r.branch || '')}</span></div>
+        <div class="small">${r.rows} 排 × ${r.cols} 位・共 ${r.seats?.length || 0} 個座位${r.aisles?.length ? `・走道 ${r.aisles.join(', ')}` : ''}</div>
+        <div class="muted small">${used ? `目前有 ${used} 個班級在這間教室上課` : '還沒有班級使用'}</div>
+      </div>
+      <div class="btn-group">
+        <button type="button" class="btn small" data-ract="edit" data-id="${r.id}">編輯</button>
+        <button type="button" class="btn small" data-ract="dup" data-id="${r.id}">複製</button>
+        <button type="button" class="btn small danger" data-ract="del" data-id="${r.id}">刪除</button>
+      </div>
+    </div>`;
+  }).join('');
+  box.querySelectorAll('[data-ract]').forEach((b) => b.addEventListener('click', () => {
+    const r = state.rooms.find((x) => x.id === b.dataset.id);
+    if (!r) return;
+    if (b.dataset.ract === 'edit') openRoomEditor(r, false);
+    else if (b.dataset.ract === 'dup') openRoomEditor(r, true);
+    else deleteRoom(r);
+  }));
+}
+
+function openRoomEditor(r, duplicate) {
+  state.editingRoomId = r && !duplicate ? r.id : null;
+  $('room-editor-title').textContent = !r ? '新增教室' : duplicate ? '複製教室（另存為新教室）' : '編輯教室';
+  $('r-branch').innerHTML = BRANCHES.map((b) => `<option>${escapeHtml(b)}</option>`).join('');
+  $('r-branch').value = r?.branch || $('r-branch-filter').value || BRANCHES[0] || '';
+  $('r-name').value = r ? r.name + (duplicate ? '（複製）' : '') : '';
+  $('r-rows').value = r?.rows || 6;
+  $('r-cols').value = r?.cols || 8;
+  $('r-aisles').value = (r?.aisles || []).join(', ');
+  state.roomDisabled = new Set(r?.disabled || []);
+  renderRoomPreview();
+  show('view-room-editor');
+}
+
+function readRoomLayout() {
+  const rows = Math.min(26, Math.max(1, parseInt($('r-rows').value, 10) || 1));
+  const cols = Math.min(30, Math.max(1, parseInt($('r-cols').value, 10) || 1));
+  const aisles = parseNumberList($('r-aisles').value).filter((n) => n < cols);
+  const all = new Set(buildSeatList(rows, cols));
+  const disabled = [...state.roomDisabled].filter((id) => all.has(id));
+  return { rows, cols, aisles, disabled, seats: buildSeatList(rows, cols, disabled) };
+}
+
+function renderRoomPreview() {
+  const layout = readRoomLayout();
+  renderSeatMap($('room-preview'), layout, (id) => (
+    state.roomDisabled.has(id) ? { state: 'disabled', label: '' } : { state: 'available' }
+  ), (id) => {
+    if (state.roomDisabled.has(id)) state.roomDisabled.delete(id); else state.roomDisabled.add(id);
+    renderRoomPreview();
+  }, { allCells: true });
+  $('room-count').textContent = `共 ${layout.seats.length} 個座位`;
+}
+
+$('room-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const layout = readRoomLayout();
+  const name = $('r-name').value.trim();
+  const branch = $('r-branch').value;
+  if (!name) return toast('請填寫教室名稱', 'error');
+  if (!layout.seats.length) return toast('至少要有一個座位', 'error');
+  const dup = state.rooms.find((r) => r.id !== state.editingRoomId && r.branch === branch && normTitle(r.name) === normTitle(name));
+  if (dup) return toast(`${branch} 已經有「${dup.name}」了`, 'error');
+  const btn = $('r-submit');
+  btn.disabled = true;
+  try {
+    const data = { branch, name, ...layout, updatedAt: serverTimestamp() };
+    if (state.editingRoomId) await updateDoc(doc(db, 'rooms', state.editingRoomId), data);
+    else await setDoc(doc(collection(db, 'rooms')), { ...data, createdAt: serverTimestamp() });
+    toast('已儲存教室範本', 'success');
+    openRooms();
+  } catch (err) {
+    console.error(err);
+    toast(err.code === 'permission-denied'
+      ? '儲存失敗：請到 Firebase 重新貼上最新的 firestore.rules（記得改管理員 email）並發布'
+      : '儲存失敗：' + (err.code || err.message), 'error');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+async function deleteRoom(r) {
+  if (!confirm(`確定刪除教室範本「${r.branch} ${r.name}」？\n已經建好的班級不受影響。`)) return;
+  try {
+    const batch = writeBatch(db);
+    batch.delete(doc(db, 'rooms', r.id));
+    await batch.commit();
+    toast('已刪除教室範本', 'success');
+  } catch (err) {
+    console.error(err);
+    toast('刪除失敗：' + (err.code || err.message), 'error');
+  }
+}
+
+// ---------- 列印座位表 ----------
+function printSeatChart({ view, withList, withPhone }) {
+  const c = state.detail;
+  if (!c) return;
+  const teacher = view === 'teacher';
+  const seatToKey = new Map([...state.holders].map(([k, h]) => [h.seatId, k]));
+  const nameOf = (seatId) => {
+    const k = seatToKey.get(seatId);
+    return k && state.roster.get(k) ? state.roster.get(k).name : '';
+  };
+  const valid = new Set(c.seats || []);
+  const aisles = new Set(c.aisles || []);
+  const rowIdx = [...Array(c.rows).keys()];
+  const colIdx = [...Array(c.cols).keys()].map((i) => i + 1);
+  if (teacher) { rowIdx.reverse(); colIdx.reverse(); }
+  const rowLabel = (i) => String.fromCharCode(65 + i);
+  const seatW = Math.max(46, Math.min(110, Math.floor(1000 / (c.cols + aisles.size * 0.35))));
+
+  let grid = '';
+  rowIdx.forEach((r) => {
+    grid += `<div class="row"><span class="rl">${rowLabel(r)}</span>`;
+    colIdx.forEach((col, i) => {
+      const id = rowLabel(r) + col;
+      if (!valid.has(id)) grid += '<span class="seat none"></span>';
+      else {
+        const n = nameOf(id);
+        grid += `<span class="seat ${n ? '' : 'empty'}"><small>${id}</small><b>${escapeHtml(n)}</b></span>`;
+      }
+      // 走道在「第 col 號座位右邊」；老師視角左右相反，所以走道出現在該座位的左邊
+      const next = colIdx[i + 1];
+      if (next !== undefined && (teacher ? aisles.has(next) : aisles.has(col))) grid += '<span class="aisle"></span>';
+    });
+    grid += `<span class="rl">${rowLabel(r)}</span></div>`;
+  });
+  const stage = '<div class="stage">講 台</div>';
+
+  let list = '';
+  if (withList) {
+    const seated = [...state.roster]
+      .map(([key, s]) => ({ ...s, seat: state.holders.get(key)?.seatId || '' }))
+      .sort((a, b) => (!a.seat - !b.seat) || (a.seat && b.seat ? seatOrder(a.seat, b.seat) : a.name.localeCompare(b.name, 'zh-Hant')));
+    list = `<h2>座位名單（${seated.length} 人）</h2><table><thead><tr><th>座位</th><th>姓名</th>${withPhone ? '<th>家長手機</th>' : ''}<th>簽到</th></tr></thead><tbody>`
+      + seated.map((s) => `<tr><td>${s.seat || '<i>未劃位</i>'}</td><td>${escapeHtml(s.name)}</td>${withPhone ? `<td>${escapeHtml(s.phone)}</td>` : ''}<td></td></tr>`).join('')
+      + '</tbody></table>';
+  }
+
+  const now = new Date();
+  const printed = `${now.getFullYear()}/${now.getMonth() + 1}/${now.getDate()}`;
+  const html = `<!DOCTYPE html><html lang="zh-Hant"><head><meta charset="UTF-8"><title>${escapeHtml(c.title)} 座位表</title>
+<style>
+@page { size: A4 landscape; margin: 10mm; }
+* { box-sizing: border-box; }
+body { font-family: "PingFang TC","Noto Sans TC","Microsoft JhengHei",sans-serif; color: #111; margin: 0; padding: 16px; }
+h1 { font-size: 20px; margin: 0 0 2px; }
+.meta { color: #555; font-size: 13px; margin-bottom: 4px; }
+.view { color: #555; font-size: 12px; margin-bottom: 12px; }
+.chart { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.stage { width: 50%; text-align: center; border: 1.5px solid #333; border-radius: 4px; padding: 4px; letter-spacing: .4em; font-size: 13px; margin: 6px 0; }
+.row { display: flex; gap: 4px; align-items: stretch; }
+.rl { width: 16px; display: flex; align-items: center; justify-content: center; font-size: 11px; color: #666; }
+.seat { width: ${seatW}px; min-height: 44px; border: 1.2px solid #333; border-radius: 5px; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 2px; overflow: hidden; }
+.seat small { font-size: 9px; color: #777; line-height: 1; }
+.seat b { font-size: ${seatW < 60 ? 11 : 14}px; font-weight: 600; line-height: 1.25; text-align: center; word-break: break-all; }
+.seat.empty { border-style: dashed; border-color: #aaa; }
+.seat.none { border: 0; }
+.aisle { width: 14px; }
+h2 { font-size: 15px; margin: 18px 0 6px; page-break-before: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 12px; }
+th, td { border: 1px solid #999; padding: 4px 8px; text-align: left; }
+th { background: #eee; }
+td:last-child { width: 80px; }
+.list { columns: 1; }
+@media print { .noprint { display: none; } }
+.noprint { margin-bottom: 12px; }
+.noprint button { font-size: 14px; padding: 6px 14px; }
+</style></head><body>
+<div class="noprint"><button onclick="window.print()">列印</button></div>
+<h1>${escapeHtml(c.title)}　座位表</h1>
+<div class="meta">${escapeHtml(classMeta(c))}</div>
+<div class="view">${teacher ? '老師視角：從講台往台下看' : '學生視角：面向講台'}・列印日期 ${printed}・已劃位 ${state.holders.size} / 學生 ${state.roster.size} 人</div>
+<div class="chart">${teacher ? '' : stage}${grid}${teacher ? stage : ''}</div>
+${list}
+<script>window.addEventListener('load', () => setTimeout(() => window.print(), 300));<\/script>
+</body></html>`;
+
+  const w = window.open('', '_blank');
+  if (!w) return toast('瀏覽器擋住了新分頁，請允許這個網站開啟彈出式視窗後再試一次', 'error');
+  w.document.open();
+  w.document.write(html);
+  w.document.close();
 }

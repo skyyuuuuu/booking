@@ -39,11 +39,103 @@
         <div class="btn-group">
           <select id="f-branch" class="inline-select"></select>
           <button type="button" id="btn-copy-site" class="btn">複製家長劃位網址</button>
+          <button type="button" id="btn-rooms" class="btn">教室座位範本</button>
+          <button type="button" id="btn-batch" class="btn">批次建立班級</button>
           <button type="button" id="btn-import" class="btn">整份名冊匯入</button>
           <button type="button" id="btn-new" class="btn primary">＋ 新增班級</button>
         </div>
       </div>
       <div id="admin-class-list" class="card-list"></div>
+    </section>
+
+    <!-- 教室座位範本 -->
+    <section id="view-rooms" class="hidden">
+      <button type="button" class="btn-link js-back">← 回班級列表</button>
+      <div class="toolbar">
+        <h2 class="section-title">教室座位範本</h2>
+        <div class="btn-group">
+          <select id="r-branch-filter" class="inline-select"></select>
+          <button type="button" id="btn-new-room" class="btn primary">＋ 新增教室</button>
+        </div>
+      </div>
+      <p class="muted small">每間教室畫一次座位圖，新增班級時選教室就會自動套用；批次建立班級時，「分校＋教室」對得上的也會自動套用。修改範本不會影響已經建好的班級。</p>
+      <div id="room-list" class="card-list"></div>
+    </section>
+
+    <section id="view-room-editor" class="hidden">
+      <button type="button" class="btn-link js-back-rooms">← 回教室列表</button>
+      <h2 id="room-editor-title" class="section-title">新增教室</h2>
+      <form id="room-form" class="editor">
+        <div class="form-grid">
+          <label>分校 *
+            <select id="r-branch" required></select>
+          </label>
+          <label>教室名稱 *
+            <input id="r-name" type="text" required maxlength="30" placeholder="例：301 教室">
+          </label>
+          <label>排數（A、B、C…，最多 26）
+            <input id="r-rows" type="number" min="1" max="26" value="6" required>
+          </label>
+          <label>每排座位數（最多 30）
+            <input id="r-cols" type="number" min="1" max="30" value="8" required>
+          </label>
+          <label class="span2">走道位置：在第幾號座位右邊留走道（用逗號分隔）
+            <input id="r-aisles" type="text" placeholder="例：2, 6">
+          </label>
+        </div>
+        <p class="muted small">在下方預覽圖點一下座位可以切換「不設座位」（灰色虛線），例如柱子、講桌旁的位置。</p>
+        <div id="room-preview" class="seat-map-wrap"></div>
+        <p id="room-count" class="muted small center"></p>
+        <div class="form-actions">
+          <button type="button" class="btn js-back-rooms">取消</button>
+          <button type="submit" id="r-submit" class="btn primary">儲存教室</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- 批次建立班級 -->
+    <section id="view-batch" class="hidden">
+      <button type="button" class="btn-link js-back">← 回班級列表</button>
+      <h2 class="section-title">批次建立班級</h2>
+      <div class="panel">
+        <p class="small">從名冊的「班級清單」分頁選取 A～H 欄複製，貼在下面。含標題列也沒關係。一列一個班，欄位順序：</p>
+        <p class="small"><b>班級名稱</b>、學期、上課時間、分校、教室、排數、每排座位數、走道</p>
+        <ul class="small muted tight">
+          <li>只有「班級名稱」必填，其他可以留空。</li>
+          <li>排數、每排座位數留空的班級，會套用下面選的預設座位。</li>
+          <li>同學期、同分校已經有同名班級的，會自動略過，不會重複建立。</li>
+          <li>建好的班級預設「未開放」，加好學生名單後再開放劃位。</li>
+        </ul>
+        <h3>預設座位</h3>
+        <div class="form-grid">
+          <label class="span2">座位配置
+            <select id="b-template"></select>
+          </label>
+          <label>排數
+            <input id="b-rows" type="number" min="1" max="26" value="6">
+          </label>
+          <label>每排座位數
+            <input id="b-cols" type="number" min="1" max="30" value="8">
+          </label>
+          <label class="span2">走道位置（逗號分隔）
+            <input id="b-aisles" type="text" placeholder="例：2, 6">
+          </label>
+        </div>
+        <textarea id="b-text" rows="8" placeholder="班級名稱	學期	上課時間	分校	教室	排數	每排座位數	走道&#10;高一數學A班	115 上	每週二 19:00-21:00	愛學館培英校	301	6	8	2, 6&#10;高一英文	115 上	每週四 19:00-21:00	愛學館培英校	302"></textarea>
+        <p id="b-status" class="muted small"></p>
+      </div>
+
+      <div id="b-preview" class="hidden">
+        <h3 class="section-title">預覽</h3>
+        <div id="b-problems"></div>
+        <table class="table">
+          <thead><tr><th>班級名稱</th><th>學期</th><th>上課時間</th><th>分校</th><th>教室</th><th>座位</th><th>狀態</th></tr></thead>
+          <tbody id="b-rows-preview"></tbody>
+        </table>
+        <div class="form-actions">
+          <button type="button" id="b-submit" class="btn primary">確認建立</button>
+        </div>
+      </div>
     </section>
 
     <!-- 整份名冊匯入 -->
@@ -112,6 +204,9 @@
 
         <h3>座位配置</h3>
         <div class="form-grid">
+          <label class="span2">套用教室座位範本
+            <select id="e-room-template"></select>
+          </label>
           <label>排數（A、B、C…，最多 26）
             <input id="e-rows" type="number" min="1" max="26" value="6" required>
           </label>
@@ -146,6 +241,7 @@
         <div id="d-stat"></div>
         <div class="btn-group">
           <button type="button" id="d-toggle" class="btn"></button>
+          <button type="button" id="d-print" class="btn">列印座位表</button>
           <button type="button" id="d-export" class="btn">匯出 CSV</button>
         </div>
       </div>
@@ -187,6 +283,26 @@
       <div class="modal-actions">
         <button type="button" id="a-cancel" class="btn">取消</button>
         <button type="submit" class="btn primary">確定</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- 列印座位表 -->
+  <div id="print-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <form id="print-form" class="modal-box">
+      <h3>列印座位表</h3>
+      <label>視角
+        <select id="p-view">
+          <option value="student">學生視角（講台在上方）</option>
+          <option value="teacher">老師視角（講台在下方、左右相反，站在講台看台下）</option>
+        </select>
+      </label>
+      <label class="check"><input id="p-list" type="checkbox" checked> 附上座位名單（含未劃位學生）</label>
+      <label class="check"><input id="p-phone" type="checkbox"> 名單顯示家長手機</label>
+      <p class="muted small">會開一個新分頁並跳出列印視窗，建議用 A4 橫向；也可以在列印視窗選「另存為 PDF」。</p>
+      <div class="modal-actions">
+        <button type="button" id="p-cancel" class="btn">取消</button>
+        <button type="submit" class="btn primary">列印</button>
       </div>
     </form>
   </div>
