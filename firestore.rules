@@ -1,0 +1,119 @@
+rules_version = '2';
+
+// ============================================================
+// 劃位系統 Firestore 安全規則
+// 部署方式：Firebase Console → Firestore Database → 規則 → 整份貼上 → 發布
+// ⚠️ 請把下面 isAdmin() 裡的 email 改成你的管理員 Gmail（可放多個）
+// ============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      // 用 get() 讀取，匿名使用者沒有 email 欄位時才不會出錯
+      return signedIn()
+        && request.auth.token.get('email_verified', false) == true
+        && request.auth.token.get('email', '') in [
+          'YOUR_ADMIN_EMAIL@gmail.com'
+        ];
+    }
+
+    // ---------- 場次 ----------
+    // 所有人可讀（前台要顯示場次與座位圖），只有管理員可新增/修改/刪除
+    match /sessions/{sid} {
+      allow read: if true;
+      allow write: if isAdmin();
+
+      function sessionData() {
+        return get(/databases/$(database)/documents/sessions/$(sid)).data;
+      }
+      function seatPath(seatId) {
+        return /databases/$(database)/documents/sessions/$(sid)/seats/$(seatId);
+      }
+      function bookingPath(uid) {
+        return /databases/$(database)/documents/sessions/$(sid)/bookings/$(uid);
+      }
+      function phonePath(phone) {
+        return /databases/$(database)/documents/sessions/$(sid)/phones/$(phone);
+      }
+
+      // ---------- 座位（公開，只記錄誰佔用，不含個資） ----------
+      // 文件 ID = 座位代號（例如 B3）。文件存在 = 已被劃走。
+      // Firestore 的 create 只在「文件不存在」時成立，所以同一個位子不可能被兩個人劃到。
+      match /seats/{seatId} {
+        allow read: if true;
+
+        allow create: if signedIn()
+          && sessionData().open == true
+          && seatId in sessionData().seats
+          && request.resource.data.keys().hasOnly(['uid', 'bookedAt'])
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.bookedAt == request.time
+          // 必須同時建立自己的劃位資料，且指向這個座位
+          && getAfter(bookingPath(request.auth.uid)).data.seatId == seatId;
+
+        allow delete: if isAdmin()
+          || (signedIn()
+              && sessionData().open == true
+              && resource.data.uid == request.auth.uid
+              // 取消時必須連同劃位資料一起刪除
+              && !existsAfter(bookingPath(request.auth.uid)));
+
+        allow update: if false;
+      }
+
+      // ---------- 劃位資料（含姓名、電話，只有本人與管理員看得到） ----------
+      // 文件 ID = 使用者 uid，所以每個人每場次只能有一筆
+      match /bookings/{uid} {
+        allow get: if isAdmin() || (signedIn() && request.auth.uid == uid);
+        allow list: if isAdmin();
+
+        allow create: if signedIn()
+          && request.auth.uid == uid
+          && sessionData().open == true
+          && request.resource.data.keys().hasOnly(['seatId', 'name', 'phone', 'bookedAt'])
+          && request.resource.data.keys().hasAll(['seatId', 'name', 'phone', 'bookedAt'])
+          && request.resource.data.name is string
+          && request.resource.data.name.size() >= 1
+          && request.resource.data.name.size() <= 20
+          && request.resource.data.phone is string
+          && request.resource.data.phone.matches('^09[0-9]{8}$')
+          && request.resource.data.bookedAt == request.time
+          && getAfter(seatPath(request.resource.data.seatId)).data.uid == uid
+          && getAfter(phonePath(request.resource.data.phone)).data.uid == uid;
+
+        allow delete: if isAdmin()
+          || (signedIn()
+              && request.auth.uid == uid
+              && sessionData().open == true
+              && !existsAfter(seatPath(resource.data.seatId))
+              && !existsAfter(phonePath(resource.data.phone)));
+
+        allow update: if false;
+      }
+
+      // ---------- 手機索引（確保同一支手機每場次只能劃一個位子） ----------
+      // 文件 ID = 手機號碼，不公開
+      match /phones/{phone} {
+        allow get: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+        allow list: if isAdmin();
+
+        allow create: if signedIn()
+          && request.resource.data.keys().hasOnly(['uid'])
+          && request.resource.data.uid == request.auth.uid
+          && getAfter(bookingPath(request.auth.uid)).data.phone == phone;
+
+        allow delete: if isAdmin()
+          || (signedIn()
+              && resource.data.uid == request.auth.uid
+              && !existsAfter(bookingPath(request.auth.uid)));
+
+        allow update: if false;
+      }
+    }
+  }
+}
