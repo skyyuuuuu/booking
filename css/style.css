@@ -280,3 +280,27 @@ label.check.inline { margin: 0; font-size: 0.85rem; color: var(--muted); }
 .chip .chip-main { padding-right: 4px; }
 .chip .chip-x { color: var(--muted); padding-left: 4px; }
 .chip:hover { border-color: var(--brand); }
+ul.tight { margin: 4px 0 10px; padding-left: 20px; }
+ul.tight li { margin: 2px 0; }
+.ok-text { color: var(--ok); }
+#view-import .panel textarea { margin-top: 10px; font-size: 0.92rem; }
+#view-import .form-grid { margin-top: 8px; }
+#i-preview { margin-top: 20px; }
+#i-removals { margin-top: 14px; }
+#i-removals .check { margin: 0 0 8px; }
+#i-preview .form-actions { margin-top: 14px; }
+#view-batch .panel textarea { margin-top: 12px; font-size: 0.92rem; }
+#view-batch h3 { margin: 16px 0 6px; }
+#b-preview { margin-top: 20px; }
+#b-preview .form-actions { margin-top: 14px; }
+input:disabled { background: #f0f2f1; color: var(--muted); }
+.notice.warn-box { background: #fff6e0; color: #7a5300; }
+
+/* ---------- 角色 ---------- */
+.role-badge { font-size: 0.75rem; background: rgba(255,255,255,0.18); padding: 2px 8px; border-radius: 99px; }
+.role-badge:empty { display: none; }
+body[data-role="staff"] [data-min="manager"],
+body:not([data-role="owner"]) [data-min="owner"] { display: none !important; }
+#view-logs .inline-select { min-width: 150px; }
+#l-rows td:first-child { white-space: nowrap; }
+#admin-form { display: flex; flex-direction: column; gap: 12px; }

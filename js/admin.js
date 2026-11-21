@@ -1,17 +1,18 @@
 import {
   onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut,
-  collection, doc, getDocs, onSnapshot, setDoc, updateDoc,
+  collection, doc, getDoc, getDocs, onSnapshot, setDoc, updateDoc, query, orderBy, limit,
   writeBatch, serverTimestamp, getCountFromServer, arrayUnion, arrayRemove
 } from './firebase-sdk.js';
 import {
   auth, db, configMissing, renderSeatMap, buildSeatList, parseNumberList,
-  normalizeName, normalizePhone, isValidPhone, studentKey, takeSeat, releaseSeat,
+  normalizeName, normalizePhone, isValidPhone, normalizeSerial, isValidSerial, studentKey, takeSeat, releaseSeat,
   escapeHtml, classSort, classMeta, seatOrder, toast
 } from './common.js';
 import { ADMIN_EMAILS, BRANCHES } from './firebase-config.js';
 
 const $ = (id) => document.getElementById(id);
-const VIEWS = ['view-login', 'view-denied', 'view-list', 'view-editor', 'view-detail', 'view-import', 'view-batch', 'view-rooms', 'view-room-editor'];
+const VIEWS = ['view-login', 'view-denied', 'view-list', 'view-editor', 'view-detail', 'view-import', 'view-batch', 'view-rooms', 'view-room-editor', 'view-logs', 'view-admins'];
+const ROLE_LABEL = { owner: '最高管理者', manager: '主管', staff: '櫃台' };
 
 const state = {
   classes: [],
@@ -19,18 +20,22 @@ const state = {
   detailUnsubs: [],
   cid: null,                 // 目前管理中的班級
   detail: null,
-  roster: new Map(),         // key -> { name, phone }
+  roster: new Map(),         // key -> { name, serial, phone }
   holders: new Map(),        // key -> { bid, seatId }
   seats: new Map(),          // seatId -> { bid }
   editingId: null,           // null = 新增
   dupFrom: null,             // 複製來源班級 ID
   disabled: new Set(),
   assignSeat: null,
+  me: null,                  // { email, name, role }
+  adminsUnsub: null,
+  logLimit: 200,
+  logs: [],
   rooms: [],                 // 教室座位範本
   roomsUnsub: null,
   editingRoomId: null,
   roomDisabled: new Set(),
-  rosters: null,             // 整份匯入用：cid -> Map(key -> { name, phone })
+  rosters: null,             // 整份匯入用：cid -> Map(key -> { name, serial, phone })
   plan: null                 // 整份匯入的比對結果
 };
 
@@ -67,16 +72,54 @@ if (configMissing) {
     }
     $('user-email').textContent = user.email;
     $('user-box').classList.remove('hidden');
-    const allowed = ADMIN_EMAILS.map((e) => e.toLowerCase()).includes(String(user.email).toLowerCase());
-    if (!allowed) {
-      $('denied-email').textContent = user.email;
-      stopListening();
-      show('view-denied');
-      return;
-    }
-    startListening();
-    show('view-list');
+    resolveRole(user).then((me) => {
+      state.me = me;
+      document.body.dataset.role = me ? me.role : '';
+      $('user-role').textContent = me ? ROLE_LABEL[me.role] : '';
+      if (!me) {
+        $('denied-email').textContent = user.email;
+        stopListening();
+        show('view-denied');
+        return;
+      }
+      startListening();
+      show('view-list');
+    });
   });
+}
+
+// 判斷角色：firebase-config.js 的 ADMIN_EMAILS 是最高管理者（要和安全規則一致），其他人看「管理員帳號」名單
+async function resolveRole(user) {
+  const email = String(user.email || '').toLowerCase();
+  if (ADMIN_EMAILS.map((e) => e.toLowerCase()).includes(email)) return { email, name: user.displayName || email, role: 'owner' };
+  try {
+    const snap = await getDoc(doc(db, 'admins', email));
+    if (snap.exists() && ['manager', 'staff'].includes(snap.data().role)) {
+      return { email, name: snap.data().name || user.displayName || email, role: snap.data().role };
+    }
+  } catch (err) {
+    console.warn(err);
+  }
+  return null;
+}
+
+const can = (need) => state.me && (need === 'staff' || (need === 'manager' && state.me.role !== 'staff') || (need === 'owner' && state.me.role === 'owner'));
+
+function denyMsg(err) {
+  return err && err.code === 'permission-denied' ? '你的帳號沒有這個權限（或安全規則還沒更新）' : '';
+}
+
+// 寫入操作紀錄（失敗不影響原本的操作）
+async function log(action, summary, c) {
+  if (!state.me) return;
+  try {
+    await setDoc(doc(collection(db, 'logs')), {
+      at: serverTimestamp(), by: state.me.email, byName: state.me.name, role: state.me.role,
+      action, summary: String(summary).slice(0, 2000), classId: c?.id || '', classTitle: c?.title || ''
+    });
+  } catch (err) {
+    console.warn('寫入操作紀錄失敗', err);
+  }
 }
 
 $('btn-login').addEventListener('click', async () => {
@@ -131,6 +174,8 @@ function stopListening() {
   state.listUnsub = null;
   if (state.roomsUnsub) state.roomsUnsub();
   state.roomsUnsub = null;
+  if (state.adminsUnsub) state.adminsUnsub();
+  state.adminsUnsub = null;
   stopDetail();
 }
 
@@ -156,10 +201,10 @@ function renderList() {
       </div>
       <div class="btn-group">
         <button type="button" class="btn small primary" data-act="detail" data-id="${c.id}">管理名單／座位</button>
-        <button type="button" class="btn small" data-act="toggle" data-id="${c.id}">${c.open ? '關閉劃位' : '開放劃位'}</button>
-        <button type="button" class="btn small" data-act="edit" data-id="${c.id}">編輯</button>
-        <button type="button" class="btn small" data-act="dup" data-id="${c.id}">複製</button>
-        <button type="button" class="btn small danger" data-act="del" data-id="${c.id}">刪除</button>
+        <button type="button" class="btn small" data-act="toggle" data-id="${c.id}" data-min="manager">${c.open ? '關閉劃位' : '開放劃位'}</button>
+        <button type="button" class="btn small" data-act="edit" data-id="${c.id}" data-min="manager">編輯</button>
+        <button type="button" class="btn small" data-act="dup" data-id="${c.id}" data-min="manager">複製</button>
+        <button type="button" class="btn small danger" data-act="del" data-id="${c.id}" data-min="manager">刪除</button>
       </div>
     </div>`).join('');
 
@@ -188,9 +233,10 @@ async function toggleOpen(c) {
   try {
     await updateDoc(doc(db, 'classes', c.id), { open: !c.open, updatedAt: serverTimestamp() });
     toast(c.open ? '已關閉劃位' : '已開放劃位', 'success');
+    log(c.open ? '關閉劃位' : '開放劃位', `${c.open ? '關閉' : '開放'}「${c.title}」的劃位`, c);
   } catch (err) {
     console.error(err);
-    toast('更新失敗：' + err.code, 'error');
+    toast(denyMsg(err) || '更新失敗：' + err.code, 'error');
   }
 }
 
@@ -216,6 +262,7 @@ async function deleteClass(c) {
     ops.push((b) => b.delete(doc(db, 'classes', c.id)));
     await commitInChunks(ops);
     toast('已刪除班級', 'success');
+    log('刪除班級', `刪除「${c.title}」（${classMeta(c)}），名單 ${roster.docs.length} 人`, c);
   } catch (err) {
     console.error(err);
     toast('刪除失敗：' + err.code, 'error');
@@ -325,21 +372,27 @@ $('editor-form').addEventListener('submit', async (e) => {
       }
       await updateDoc(doc(db, 'classes', state.editingId), data);
       toast('已儲存', 'success');
+      log('編輯班級', `編輯「${data.title}」：${classMeta(data)}，座位 ${data.rows}×${data.cols}（${data.seats.length} 位），${data.open ? '開放' : '未開放'}劃位`, { id: state.editingId, title: data.title });
       show('view-list');
     } else {
       const ref = doc(collection(db, 'classes'));
       await setDoc(ref, { ...data, createdAt: serverTimestamp() });
       // 複製班級時，可選擇一起複製學生名單（例如下學期續班）
+      let copied = 0;
       if (state.dupFrom && confirm('要一起複製原班級的學生名單嗎？\n（只複製名單，不複製座位）')) {
         const roster = await getDocs(collection(db, 'classes', state.dupFrom, 'roster'));
-        await commitInChunks(roster.docs.flatMap((d) => addStudentOps(ref.id, d.data().name, d.data().phone)));
+        const docs = roster.docs.filter((d) => d.data().serial);
+        await commitInChunks(docs.flatMap((d) => addStudentOps(ref.id, d.data().name, d.data().serial, d.data().phone)));
+        copied = docs.length;
       }
       toast('已建立班級，接著加入學生名單', 'success');
+      const from = state.dupFrom && state.classes.find((x) => x.id === state.dupFrom);
+      log('新增班級', `新增「${data.title}」：${classMeta(data)}，座位 ${data.seats.length} 位${from ? `（複製自「${from.title}」${copied ? `，含名單 ${copied} 人` : ''}）` : ''}`, { id: ref.id, title: data.title });
       openDetail(ref.id);
     }
   } catch (err) {
     console.error(err);
-    toast('儲存失敗：' + err.code, 'error');
+    toast(denyMsg(err) || '儲存失敗：' + err.code, 'error');
   } finally {
     btn.disabled = false;
   }
@@ -403,7 +456,7 @@ function renderDetail() {
     if (!state.seats.has(id)) return { state: 'available' };
     const key = seatToKey.get(id);
     const s = key && state.roster.get(key);
-    return { state: 'taken', label: s ? s.name.slice(0, 3) : '?', title: s ? `${id} ${s.name} ${s.phone}` : `${id}（無對應學生）` };
+    return { state: 'taken', label: s ? s.name.slice(0, 3) : '?', title: s ? `${id} ${s.name} ${s.serial || ''} ${s.phone || ''}` : `${id}（無對應學生）` };
   }, (id, seatState) => {
     if (seatState === 'available') return openAssign(id);
     if (seatState !== 'taken') return;
@@ -422,14 +475,15 @@ function renderDetail() {
   $('d-rows').innerHTML = rows.length ? rows.map((r) => `
     <tr>
       <td>${escapeHtml(r.name)}</td>
-      <td>${escapeHtml(r.phone)}</td>
+      <td>${r.serial ? escapeHtml(r.serial) : '<span class="warn small">舊資料，請重新匯入</span>'}</td>
+      <td>${escapeHtml(r.phone || '')}</td>
       <td>${r.holder ? `<span class="seat-tag">${escapeHtml(r.holder.seatId)}</span>` : '<span class="status todo">未劃位</span>'}</td>
       <td class="nowrap">
         ${r.holder ? `<button type="button" class="btn small" data-cancel="${escapeHtml(r.key)}">取消座位</button>` : ''}
-        <button type="button" class="btn small danger" data-remove="${escapeHtml(r.key)}">移出</button>
+        <button type="button" class="btn small danger" data-remove="${escapeHtml(r.key)}" data-min="manager">移出</button>
       </td>
     </tr>`).join('')
-    : `<tr><td colspan="4" class="muted center">${total ? '全部學生都劃好位了 🎉' : '還沒有學生，請在右邊加入名單'}</td></tr>`;
+    : `<tr><td colspan="5" class="muted center">${total ? '全部學生都劃好位了 🎉' : '還沒有學生，請在右邊加入名單'}</td></tr>`;
 
   $('d-rows').querySelectorAll('[data-cancel]').forEach((b) => b.addEventListener('click', () => cancelStudentSeat(b.dataset.cancel)));
   $('d-rows').querySelectorAll('[data-remove]').forEach((b) => b.addEventListener('click', () => removeStudent(b.dataset.remove)));
@@ -455,6 +509,7 @@ async function cancelStudentSeat(key) {
   try {
     await releaseSeat(state.cid, key, h);
     toast('已取消座位', 'success');
+    log('取消座位', `取消 ${s ? s.name : key} 的座位 ${h.seatId}`, state.detail);
   } catch (err) {
     console.error(err);
     toast('取消失敗：' + err.code, 'error');
@@ -471,6 +526,7 @@ async function releaseOrphanSeat(seatId) {
     if (seat?.bid) batch.delete(doc(db, 'classes', state.cid, 'bookings', seat.bid));
     await batch.commit();
     toast('已釋放座位', 'success');
+    log('釋放座位', `釋放沒有對應學生的座位 ${seatId}`, state.detail);
   } catch (err) {
     console.error(err);
     toast('釋放失敗：' + err.code, 'error');
@@ -489,6 +545,7 @@ async function removeStudent(key) {
     batch.set(doc(db, 'students', key), { classes: arrayRemove(state.cid) }, { merge: true });
     await batch.commit();
     toast(`已移出 ${s.name}`, 'success');
+    log('移出學生', `把 ${s.name}（${s.serial || '無序號'}）移出班級${h ? `，釋放座位 ${h.seatId}` : ''}`, state.detail);
   } catch (err) {
     console.error(err);
     toast('移出失敗：' + err.code, 'error');
@@ -496,51 +553,86 @@ async function removeStudent(key) {
 }
 
 // ---------- 加入學生 ----------
+// 把一列拆成欄位：有 Tab 用 Tab（保留空欄位，從試算表複製時位置才不會跑掉），否則用逗號，再不然用空白
+function splitFields(line) {
+  if (line.includes('\t')) return line.split('\t').map((f) => f.trim());
+  if (/[,，]/.test(line)) return line.split(/[,，]/).map((f) => f.trim());
+  // 用空白分隔時，姓名中間可能也有空白（例如「林 小 華 A115004」）：第一個含數字的詞當作繳費序號
+  const t = line.trim().split(/\s+/);
+  const i = t.findIndex((x) => /\d/.test(x));
+  return i > 0 ? [t.slice(0, i).join(''), t[i], ...t.slice(i + 1)] : t;
+}
+
+const isHeaderRow = (fields) => fields.some((f) => /^(學生)?姓名$|^繳費序號$|^序號$/.test(f));
+
+// 解析一位學生：姓名、繳費序號、家長手機（手機可空白）
+function parseStudentFields(name0, serial0, phone0) {
+  const name = normalizeName(name0);
+  const serial = normalizeSerial(serial0);
+  let phone = normalizePhone(phone0);
+  let phoneNote = '';
+  if (/^9\d{8}$/.test(phone)) phone = '0' + phone;               // 試算表吃掉開頭 0 的情況
+  if (phone && !isValidPhone(phone)) { phoneNote = `手機「${phone0}」格式不對，已略過`; phone = ''; }
+  if (!name || name.length > 20 || /\d/.test(name)) return { error: '姓名空白或格式不對' };
+  if (!isValidSerial(serial)) return { error: '繳費序號空白或格式不對（只能有英文字母、數字、-，3～30 字）' };
+  if (/^09\d{8}$/.test(serial)) phoneNote = [phoneNote, `繳費序號「${serial}」看起來像手機號碼，請確認第二欄是繳費序號`].filter(Boolean).join('；');
+  return { name, serial, phone, phoneNote, key: studentKey(name, serial) };
+}
+
+// 同一個繳費序號對到不同姓名（多半是打錯字）
+function serialConflicts(students, existing = []) {
+  const names = new Map();
+  [...existing, ...students].forEach((x) => {
+    if (!x.serial) return;
+    if (!names.has(x.serial)) names.set(x.serial, new Set());
+    names.get(x.serial).add(x.name);
+  });
+  return [...names].filter(([, set]) => set.size > 1).map(([serial, set]) => `${serial}：${[...set].join('、')}`);
+}
+
 function parseRoster(text) {
   const ok = [];
   const bad = [];
+  const notes = [];
   const seen = new Set();
   String(text || '').split(/\r?\n/).forEach((line) => {
     const raw = line.trim();
     if (!raw) return;
-    const tokens = raw.split(/[\t,，、;；]+|\s{2,}|\s+(?=0?9[\d-]{7,})/).map((t) => t.trim()).filter(Boolean);
-    let phone = '';
-    const rest = [];
-    tokens.forEach((t) => {
-      const digits = normalizePhone(t);
-      if (!phone && /^9\d{8}$/.test(digits)) phone = '0' + digits;        // 試算表吃掉開頭 0 的情況
-      else if (!phone && isValidPhone(digits)) phone = digits;
-      else rest.push(t);
-    });
-    const name = normalizeName(rest.join(''));
-    if (!name || !phone || name.length > 20 || /\d/.test(name)) { bad.push(raw); return; }
-    const key = studentKey(name, phone);
-    if (seen.has(key)) return;
-    seen.add(key);
-    ok.push({ key, name, phone });
+    const f = splitFields(line);
+    if (isHeaderRow(f)) return;
+    const r = parseStudentFields(f[0], f[1], f[2]);
+    if (r.error) { bad.push(`${raw}（${r.error}）`); return; }
+    if (r.phoneNote) notes.push(`${r.name}：${r.phoneNote}`);
+    if (seen.has(r.key)) return;
+    seen.add(r.key);
+    ok.push(r);
   });
-  return { ok, bad };
+  return { ok, bad, notes };
 }
 
 function updateImportPreview() {
-  const { ok, bad } = parseRoster($('d-import').value);
+  const { ok, bad, notes } = parseRoster($('d-import').value);
   const fresh = ok.filter((s) => !state.roster.has(s.key));
   const dup = ok.length - fresh.length;
+  const conflicts = serialConflicts(ok, [...state.roster.values()]);
   const parts = [];
   if (fresh.length) parts.push(`將加入 <b>${fresh.length}</b> 位`);
   if (dup) parts.push(`${dup} 位已在名單中（略過）`);
   if (bad.length) parts.push(`<span class="warn">無法辨識 ${bad.length} 行：${bad.slice(0, 3).map(escapeHtml).join('／')}${bad.length > 3 ? '…' : ''}</span>`);
-  $('d-import-preview').innerHTML = parts.join('・');
+  if (conflicts.length) parts.push(`<span class="warn">⚠️ 同一個繳費序號對到不同姓名，請確認是否打錯字：${conflicts.map(escapeHtml).join('／')}</span>`);
+  if (notes.length) parts.push(`<span class="warn">${notes.map(escapeHtml).join('／')}</span>`);
+  $('d-import-preview').innerHTML = parts.join('<br>');
   return fresh;
 }
 
 $('d-import').addEventListener('input', updateImportPreview);
 
-function addStudentOps(cid, name, phone) {
-  const key = studentKey(name, phone);
+function addStudentOps(cid, name, serial, phone = '') {
+  const key = studentKey(name, serial);
   return [
-    (b) => b.set(doc(db, 'classes', cid, 'roster', key), { name, phone, addedAt: serverTimestamp() }),
-    (b) => b.set(doc(db, 'students', key), { name, phone, classes: arrayUnion(cid) }, { merge: true })
+    // 家長手機只存在名單（只有管理員看得到），不放進公開的學生索引
+    (b) => b.set(doc(db, 'classes', cid, 'roster', key), { name, serial, phone: phone || '', addedAt: serverTimestamp() }),
+    (b) => b.set(doc(db, 'students', key), { name, serial, classes: arrayUnion(cid) }, { merge: true })
   ];
 }
 
@@ -550,8 +642,9 @@ $('d-import-btn').addEventListener('click', async () => {
   const btn = $('d-import-btn');
   btn.disabled = true;
   try {
-    await commitInChunks(fresh.flatMap((s) => addStudentOps(state.cid, s.name, s.phone)));
+    await commitInChunks(fresh.flatMap((s) => addStudentOps(state.cid, s.name, s.serial, s.phone)));
     toast(`已加入 ${fresh.length} 位學生`, 'success');
+    log('加入學生', `加入 ${fresh.length} 位：${fresh.map((x) => `${x.name}(${x.serial})`).join('、')}`, state.detail);
     $('d-import').value = '';
     updateImportPreview();
   } catch (err) {
@@ -590,8 +683,11 @@ $('assign-form').addEventListener('submit', async (e) => {
   const seatId = state.assignSeat;
   if (!s || !seatId) return;
   try {
-    await takeSeat(state.cid, { key, name: s.name, phone: s.phone }, seatId);
+    if (!s.serial) return toast('這是舊格式的資料（沒有繳費序號），請先用新名冊重新匯入', 'error');
+    const before = state.holders.get(key)?.seatId;
+    await takeSeat(state.cid, { key, name: s.name, serial: s.serial }, seatId);
     toast(`已把 ${s.name} 排到 ${seatId}`, 'success');
+    log(before ? '代為換位' : '代為劃位', before ? `把 ${s.name} 從 ${before} 換到 ${seatId}` : `幫 ${s.name} 劃位 ${seatId}`, state.detail);
     closeAssign();
   } catch (err) {
     console.error(err);
@@ -607,13 +703,14 @@ function exportCsv() {
   const rows = [...state.roster]
     .map(([key, s]) => ({ ...s, seat: state.holders.get(key)?.seatId || '' }))
     .sort((a, b) => (!a.seat - !b.seat) || (a.seat && b.seat ? seatOrder(a.seat, b.seat) : a.name.localeCompare(b.name, 'zh-Hant')));
-  const lines = [['座位', '姓名', '家長手機'].map(cell).join(',')]
-    // 手機用 ="09..." 格式，避免 Excel / Google 試算表吃掉開頭的 0
-    .concat(rows.map((r) => [cell(r.seat || '未劃位'), cell(r.name), `="${r.phone}"`].join(',')));
+  const text = (v) => (v ? `="${String(v).replace(/"/g, '')}"` : '');   // 用 ="..." 格式，避免試算表吃掉開頭的 0
+  const lines = [['座位', '姓名', '繳費序號', '家長手機'].map(cell).join(',')]
+    .concat(rows.map((r) => [cell(r.seat || '未劃位'), cell(r.name), text(r.serial), text(r.phone)].join(',')));
   const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = `${c.term ? c.term + '_' : ''}${c.title}_座位表.csv`.replace(/[\\/:*?"<>|]/g, '_');
+  log('匯出名單', `匯出「${c.title}」座位表 CSV（${rows.length} 人）`, c);
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
@@ -658,36 +755,31 @@ function importCandidates() {
   return state.classes.filter((c) => (!term || c.term === term) && (!branch || c.branch === branch));
 }
 
-// 解析貼上的名冊：每列 姓名、手機、班級（班級可用「、」分隔多個）
+// 解析貼上的名冊：每列 學生姓名、繳費序號、家長手機、班級（手機可空白；班級可用「、」分隔多個）
 function parseBulk(text) {
   const rows = [];
   const bad = [];
+  const notes = [];
   String(text || '').split(/\r?\n/).forEach((line) => {
     const raw = line.trim();
     if (!raw) return;
     const useTab = line.includes('\t');
-    const fields = (useTab ? line.split('\t') : line.split(/[,，]/)).map((f) => f.trim()).filter(Boolean);
-    if (fields.some((f) => /^(學生)?姓名$|^(家長)?手機$|^班級$/.test(f))) return;   // 標題列
-    let phone = '';
-    const others = [];
-    fields.forEach((f) => {
-      const digits = normalizePhone(f);
-      if (!phone && /^\d[\d\s-]*$/.test(f) && /^9\d{8}$/.test(digits)) phone = '0' + digits;
-      else if (!phone && /^[\d\s-]+$/.test(f) && isValidPhone(digits)) phone = digits;
-      else others.push(f);
-    });
-    const name = normalizeName(others.shift() || '');
-    const classNames = others.join('、').split(useTab ? /[、;；\/,，]/ : /[、;；\/]/)
+    const f = useTab ? line.split('\t').map((x) => x.trim()) : line.split(/[,，]/).map((x) => x.trim());
+    if (isHeaderRow(f)) return;   // 標題列
+    const r = parseStudentFields(f[0], f[1], f[2]);
+    if (r.error) { bad.push(`${raw.replace(/\t/g, ' ')}（${r.error}）`); return; }
+    const classNames = f.slice(3).join('、').split(useTab ? /[、;；\/,，]/ : /[、;；\/]/)
       .map((t) => t.trim()).filter(Boolean);
-    if (!name || !phone || !classNames.length || name.length > 20 || /\d/.test(name)) { bad.push(raw); return; }
-    rows.push({ name, phone, key: studentKey(name, phone), classNames });
+    if (!classNames.length) { bad.push(`${raw.replace(/\t/g, ' ')}（沒有填班級）`); return; }
+    if (r.phoneNote) notes.push(`${r.name}：${r.phoneNote}`);
+    rows.push({ ...r, classNames });
   });
-  return { rows, bad };
+  return { rows, bad, notes };
 }
 
 function analyzeImport() {
   if (!state.rosters) return;
-  const { rows, bad } = parseBulk($('i-text').value);
+  const { rows, bad, notes } = parseBulk($('i-text').value);
   if (!rows.length && !bad.length) {
     $('i-preview').classList.add('hidden');
     state.plan = null;
@@ -702,7 +794,7 @@ function analyzeImport() {
 
   const unknown = new Map();     // 班級名稱 -> 筆數
   const ambiguous = new Map();   // 班級名稱 -> 符合的班級
-  const sheet = new Map();       // cid -> Map(key -> { name, phone })
+  const sheet = new Map();       // cid -> Map(key -> { name, serial, phone })
   rows.forEach((r) => r.classNames.forEach((title) => {
     const matches = byTitle.get(normTitle(title)) || [];
     if (!matches.length) unknown.set(title, (unknown.get(title) || 0) + 1);
@@ -710,7 +802,7 @@ function analyzeImport() {
     else {
       const cid = matches[0].id;
       if (!sheet.has(cid)) sheet.set(cid, new Map());
-      sheet.get(cid).set(r.key, { name: r.name, phone: r.phone });
+      sheet.get(cid).set(r.key, { name: r.name, serial: r.serial, phone: r.phone });
     }
   }));
 
@@ -719,25 +811,34 @@ function analyzeImport() {
     const roster = state.rosters.get(cid) || new Map();
     const adds = [...students].filter(([k]) => !roster.has(k)).map(([key, s]) => ({ key, ...s }));
     const existing = [...students.keys()].filter((k) => roster.has(k)).length;
+    // 已在名單、但名冊上的家長手機不一樣（或補填了）→ 更新手機
+    const phoneUpdates = [...students].filter(([k, s]) => roster.has(k) && s.phone && s.phone !== (roster.get(k).phone || ''))
+      .map(([key, s]) => ({ key, ...s }));
     const missing = [...roster].filter(([k]) => !students.has(k)).map(([key, s]) => ({ key, ...s }));
-    return { cid, c, total: students.size, adds, existing, missing };
+    return { cid, c, total: students.size, adds, existing, phoneUpdates, missing };
   }).sort((a, b) => classSort(a.c, b.c));
   state.plan = plan;
 
   // 問題列表
   const problems = [];
-  if (bad.length) problems.push(`<li>無法辨識 ${bad.length} 列（需要姓名、09 開頭的手機、班級）：${bad.slice(0, 5).map(escapeHtml).join('／')}${bad.length > 5 ? '…' : ''}</li>`);
+  if (bad.length) problems.push(`<li>無法辨識 ${bad.length} 列：${bad.slice(0, 5).map(escapeHtml).join('／')}${bad.length > 5 ? '…' : ''}</li>`);
   unknown.forEach((n, title) => problems.push(`<li>找不到班級「${escapeHtml(title)}」（${n} 筆）：請確認名稱和後台一樣，或檢查上面選的學期／分校</li>`));
   ambiguous.forEach((list, title) => problems.push(`<li>「${escapeHtml(title)}」對應到 ${list.length} 個班（${list.map((c) => escapeHtml(classMeta(c) || c.title)).join('；')}），請先選學期或分校</li>`));
-  $('i-problems').innerHTML = problems.length
-    ? `<div class="notice error"><b>這些資料不會匯入：</b><ul class="tight">${problems.join('')}</ul></div>` : '';
+  const allExisting = [...state.rosters.values()].flatMap((m) => [...m.values()]);
+  const conflicts = serialConflicts(rows, allExisting);
+  const warns = [];
+  if (conflicts.length) warns.push(`<li>同一個繳費序號對到不同姓名，請確認是否打錯字（打錯的話，系統會當成兩位不同的學生）：${conflicts.map(escapeHtml).join('／')}</li>`);
+  notes.forEach((n) => warns.push(`<li>${escapeHtml(n)}</li>`));
+  $('i-problems').innerHTML = (problems.length
+    ? `<div class="notice error"><b>這些資料不會匯入：</b><ul class="tight">${problems.join('')}</ul></div>` : '')
+    + (warns.length ? `<div class="notice warn-box"><b>請確認：</b><ul class="tight">${warns.join('')}</ul></div>` : '');
 
   $('i-rows').innerHTML = plan.length ? plan.map((p) => `
     <tr>
       <td><b>${escapeHtml(p.c.title)}</b><div class="muted small">${escapeHtml(classMeta(p.c))}</div></td>
       <td>${p.total}</td>
       <td>${p.adds.length ? `<b class="ok-text">+${p.adds.length}</b>` : '0'}</td>
-      <td>${p.existing}</td>
+      <td>${p.existing}${p.phoneUpdates.length ? `<div class="muted small">更新手機 ${p.phoneUpdates.length}</div>` : ''}</td>
       <td>${p.missing.length ? `<span class="warn">${p.missing.length}</span>` : '0'}</td>
     </tr>`).join('')
     : '<tr><td colspan="5" class="muted center">沒有可以對應的班級</td></tr>';
@@ -758,7 +859,8 @@ function analyzeImport() {
   }
 
   const addTotal = plan.reduce((n, p) => n + p.adds.length, 0);
-  $('i-status').innerHTML = `共 ${rows.length} 位學生、對應到 ${plan.length} 個班，將新加入 <b>${addTotal}</b> 筆。`;
+  const updTotal = plan.reduce((n, p) => n + p.phoneUpdates.length, 0);
+  $('i-status').innerHTML = `共 ${rows.length} 筆、對應到 ${plan.length} 個班，將新加入 <b>${addTotal}</b> 筆${updTotal ? `、更新 ${updTotal} 筆家長手機` : ''}。`;
   $('i-preview').classList.remove('hidden');
 }
 
@@ -766,9 +868,10 @@ async function runImport() {
   const plan = state.plan || [];
   const doRemove = $('i-remove')?.checked;
   const addTotal = plan.reduce((n, p) => n + p.adds.length, 0);
+  const updTotal = plan.reduce((n, p) => n + p.phoneUpdates.length, 0);
   const rmTotal = doRemove ? plan.reduce((n, p) => n + p.missing.length, 0) : 0;
-  if (!addTotal && !rmTotal) return toast('沒有需要變動的資料', 'error');
-  if (!confirm(`確定匯入？\n新加入 ${addTotal} 筆${rmTotal ? `\n移出 ${rmTotal} 筆（座位一起釋放）` : ''}`)) return;
+  if (!addTotal && !rmTotal && !updTotal) return toast('沒有需要變動的資料', 'error');
+  if (!confirm(`確定匯入？\n新加入 ${addTotal} 筆${updTotal ? `\n更新家長手機 ${updTotal} 筆` : ''}${rmTotal ? `\n移出 ${rmTotal} 筆（座位一起釋放）` : ''}`)) return;
 
   const btn = $('i-submit');
   btn.disabled = true;
@@ -776,7 +879,8 @@ async function runImport() {
   try {
     const ops = [];
     for (const p of plan) {
-      p.adds.forEach((s) => ops.push(...addStudentOps(p.cid, s.name, s.phone)));
+      p.adds.forEach((s) => ops.push(...addStudentOps(p.cid, s.name, s.serial, s.phone)));
+      p.phoneUpdates.forEach((s) => ops.push((b) => b.set(doc(db, 'classes', p.cid, 'roster', s.key), { phone: s.phone }, { merge: true })));
       if (doRemove && p.missing.length) {
         const holders = await getDocs(collection(db, 'classes', p.cid, 'holders'));
         const held = new Map(holders.docs.map((d) => [d.id, d.data()]));
@@ -793,7 +897,14 @@ async function runImport() {
       }
     }
     await commitInChunks(ops);
-    toast(`匯入完成：新加入 ${addTotal} 筆${rmTotal ? `、移出 ${rmTotal} 筆` : ''}`, 'success');
+    toast(`匯入完成：新加入 ${addTotal} 筆${updTotal ? `、更新手機 ${updTotal} 筆` : ''}${rmTotal ? `、移出 ${rmTotal} 筆` : ''}`, 'success');
+    for (const p of plan) {
+      const parts = [];
+      if (p.adds.length) parts.push(`加入 ${p.adds.length} 位：${p.adds.map((x) => `${x.name}(${x.serial})`).join('、')}`);
+      if (p.phoneUpdates.length) parts.push(`更新手機 ${p.phoneUpdates.length} 位：${p.phoneUpdates.map((x) => x.name).join('、')}`);
+      if (doRemove && p.missing.length) parts.push(`移出 ${p.missing.length} 位：${p.missing.map((x) => x.name).join('、')}`);
+      if (parts.length) await log('整份名冊匯入', parts.join('；'), p.c);
+    }
     await loadAllRosters();
     analyzeImport();
   } catch (err) {
@@ -805,22 +916,24 @@ async function runImport() {
   }
 }
 
-// 把系統目前的名單匯出成「學生姓名、家長手機、班級」三欄，可以直接貼回名冊
+// 把系統目前的名單匯出成「學生姓名、繳費序號、家長手機、班級」四欄，可以直接貼回名冊
 async function exportAllRosters() {
   const classes = importCandidates();
   if (!classes.length) return toast('沒有符合的班級', 'error');
   if (!state.rosters) await loadAllRosters();
   const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
   const rows = [];
-  classes.forEach((c) => (state.rosters.get(c.id) || new Map()).forEach((s) => rows.push([s.name, s.phone, c.title])));
-  rows.sort((a, b) => a[2].localeCompare(b[2], 'zh-Hant') || a[0].localeCompare(b[0], 'zh-Hant'));
-  const lines = [['學生姓名', '家長手機', '班級'].map(cell).join(',')]
-    .concat(rows.map((r) => [cell(r[0]), `="${r[1]}"`, cell(r[2])].join(',')));
+  classes.forEach((c) => (state.rosters.get(c.id) || new Map()).forEach((s) => rows.push([s.name, s.serial || '', s.phone || '', c.title])));
+  rows.sort((a, b) => a[3].localeCompare(b[3], 'zh-Hant') || a[0].localeCompare(b[0], 'zh-Hant'));
+  const text = (v) => (v ? `="${String(v).replace(/"/g, '')}"` : '');   // 用 ="..." 格式，避免試算表吃掉開頭的 0
+  const lines = [['學生姓名', '繳費序號', '家長手機', '班級'].map(cell).join(',')]
+    .concat(rows.map((r) => [cell(r[0]), text(r[1]), text(r[2]), cell(r[3])].join(',')));
   const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   const tag = [$('i-term').value, $('i-branch').value].filter(Boolean).join('_') || '全部';
   a.download = `學生名冊_${tag}.csv`.replace(/[\\/:*?"<>|]/g, '_');
+  log('匯出名單', `匯出系統名冊 CSV（${tag}，${rows.length} 筆）`);
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   toast(`已匯出 ${rows.length} 筆`, 'success');
@@ -990,6 +1103,7 @@ async function runBatch() {
       });
     }));
     toast(`已建立 ${items.length} 個班級，接著可以用「整份名冊匯入」加入學生`, 'success');
+    log('批次建立班級', `建立 ${items.length} 個班級：${items.map((x) => `${x.title}（${[x.term, x.branch, x.room].filter(Boolean).join('・')}）`).join('、')}`);
     $('b-text').value = '';
     show('view-list');
   } catch (err) {
@@ -1101,6 +1215,7 @@ $('room-form').addEventListener('submit', async (e) => {
     if (state.editingRoomId) await updateDoc(doc(db, 'rooms', state.editingRoomId), data);
     else await setDoc(doc(collection(db, 'rooms')), { ...data, createdAt: serverTimestamp() });
     toast('已儲存教室範本', 'success');
+    log(state.editingRoomId ? '編輯教室範本' : '新增教室範本', `${branch} ${name}：${layout.rows}×${layout.cols}，${layout.seats.length} 位`);
     openRooms();
   } catch (err) {
     console.error(err);
@@ -1119,6 +1234,7 @@ async function deleteRoom(r) {
     batch.delete(doc(db, 'rooms', r.id));
     await batch.commit();
     toast('已刪除教室範本', 'success');
+    log('刪除教室範本', `${r.branch} ${r.name}`);
   } catch (err) {
     console.error(err);
     toast('刪除失敗：' + (err.code || err.message), 'error');
@@ -1167,7 +1283,7 @@ function printSeatChart({ view, withList, withPhone }) {
       .map(([key, s]) => ({ ...s, seat: state.holders.get(key)?.seatId || '' }))
       .sort((a, b) => (!a.seat - !b.seat) || (a.seat && b.seat ? seatOrder(a.seat, b.seat) : a.name.localeCompare(b.name, 'zh-Hant')));
     list = `<h2>座位名單（${seated.length} 人）</h2><table><thead><tr><th>座位</th><th>姓名</th>${withPhone ? '<th>家長手機</th>' : ''}<th>簽到</th></tr></thead><tbody>`
-      + seated.map((s) => `<tr><td>${s.seat || '<i>未劃位</i>'}</td><td>${escapeHtml(s.name)}</td>${withPhone ? `<td>${escapeHtml(s.phone)}</td>` : ''}<td></td></tr>`).join('')
+      + seated.map((s) => `<tr><td>${s.seat || '<i>未劃位</i>'}</td><td>${escapeHtml(s.name)}</td>${withPhone ? `<td>${escapeHtml(s.phone || '')}</td>` : ''}<td></td></tr>`).join('')
       + '</tbody></table>';
   }
 
@@ -1215,4 +1331,164 @@ ${list}
   w.document.open();
   w.document.write(html);
   w.document.close();
+  log('列印座位表', `列印「${c.title}」座位表（${teacher ? '老師' : '學生'}視角${withList ? '，含名單' : ''}${withPhone ? '，含家長手機' : ''}）`, c);
+}
+
+// ---------- 操作紀錄 ----------
+$('btn-logs').addEventListener('click', () => { state.logLimit = 200; openLogs(); });
+$('l-more').addEventListener('click', () => { state.logLimit += 200; openLogs(); });
+$('l-who').addEventListener('change', renderLogs);
+$('l-q').addEventListener('input', renderLogs);
+$('l-export').addEventListener('click', exportLogs);
+
+async function openLogs() {
+  if (!can('manager')) return;
+  show('view-logs');
+  $('l-rows').innerHTML = '<tr><td colspan="4" class="muted center">讀取中…</td></tr>';
+  try {
+    const snap = await getDocs(query(collection(db, 'logs'), orderBy('at', 'desc'), limit(state.logLimit)));
+    state.logs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    $('l-more').classList.toggle('hidden', state.logs.length < state.logLimit);
+    const people = [...new Map(state.logs.map((x) => [x.by, x.byName || x.by])).entries()];
+    const cur = $('l-who').value;
+    $('l-who').innerHTML = ['<option value="">全部人員</option>']
+      .concat(people.map(([email, name]) => `<option value="${escapeHtml(email)}">${escapeHtml(name)}${name !== email ? `（${escapeHtml(email)}）` : ''}</option>`)).join('');
+    if (people.some(([e]) => e === cur)) $('l-who').value = cur;
+    renderLogs();
+  } catch (err) {
+    console.error(err);
+    $('l-rows').innerHTML = `<tr><td colspan="4" class="warn center">讀取失敗：${escapeHtml(denyMsg(err) || err.code || err.message)}</td></tr>`;
+  }
+}
+
+function logTime(ts, full = false) {
+  if (!ts?.toDate) return '';
+  const d = ts.toDate();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${full ? d.getFullYear() + '/' : ''}${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function filteredLogs() {
+  const who = $('l-who').value;
+  const q = $('l-q').value.trim().toLowerCase();
+  return state.logs.filter((x) => (!who || x.by === who)
+    && (!q || [x.action, x.summary, x.classTitle, x.byName, x.by].join(' ').toLowerCase().includes(q)));
+}
+
+function renderLogs() {
+  const list = filteredLogs();
+  $('l-rows').innerHTML = list.length ? list.map((x) => `
+    <tr>
+      <td class="small">${escapeHtml(logTime(x.at))}</td>
+      <td>${escapeHtml(x.byName || x.by)}<div class="muted small">${escapeHtml(ROLE_LABEL[x.role] || '')}</div></td>
+      <td class="nowrap">${escapeHtml(x.action)}</td>
+      <td>${x.classTitle ? `<b>${escapeHtml(x.classTitle)}</b>　` : ''}${escapeHtml(x.summary)}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="4" class="muted center">沒有符合的紀錄</td></tr>';
+}
+
+function exportLogs() {
+  const list = filteredLogs();
+  if (!list.length) return toast('沒有可以匯出的紀錄', 'error');
+  const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const lines = [['時間', '人員', 'Gmail', '角色', '動作', '班級', '內容'].map(cell).join(',')]
+    .concat(list.map((x) => [logTime(x.at, true), x.byName, x.by, ROLE_LABEL[x.role] || x.role, x.action, x.classTitle, x.summary].map(cell).join(',')));
+  const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `操作紀錄_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+// ---------- 管理員帳號（只有最高管理者） ----------
+let adminList = [];
+$('btn-admins').addEventListener('click', openAdmins);
+
+function openAdmins() {
+  if (!can('owner')) return;
+  show('view-admins');
+  if (!state.adminsUnsub) {
+    state.adminsUnsub = onSnapshot(collection(db, 'admins'), (snap) => {
+      adminList = snap.docs.map((d) => ({ id: d.id, ...d.data() }))
+        .sort((a, b) => (a.role === b.role ? String(a.name).localeCompare(String(b.name), 'zh-Hant') : a.role === 'manager' ? -1 : 1));
+      renderAdmins();
+    }, (err) => {
+      console.error(err);
+      $('a-rows').innerHTML = `<tr><td colspan="4" class="warn">讀取失敗：${escapeHtml(denyMsg(err) || err.code)}。請確認 Firebase 的安全規則已更新為最新版。</td></tr>`;
+    });
+  }
+  renderAdmins();
+}
+
+function renderAdmins() {
+  const owners = ADMIN_EMAILS.map((e) => `
+    <tr><td>${e.toLowerCase() === state.me?.email ? escapeHtml(state.me.name) + '（你）' : '—'}</td><td>${escapeHtml(e)}</td>
+      <td><span class="badge on">最高管理者</span></td><td class="muted small">寫在安全規則裡</td></tr>`).join('');
+  const others = adminList.map((a) => `
+    <tr>
+      <td>${escapeHtml(a.name || '')}</td>
+      <td>${escapeHtml(a.email || a.id)}</td>
+      <td>
+        <select class="inline-select" data-role-of="${escapeHtml(a.id)}">
+          <option value="staff" ${a.role === 'staff' ? 'selected' : ''}>櫃台</option>
+          <option value="manager" ${a.role === 'manager' ? 'selected' : ''}>主管</option>
+        </select>
+      </td>
+      <td><button type="button" class="btn small danger" data-rm-admin="${escapeHtml(a.id)}">移除</button></td>
+    </tr>`).join('');
+  $('a-rows').innerHTML = owners + (others || '<tr><td colspan="4" class="muted center">還沒有其他管理員</td></tr>');
+  $('a-rows').querySelectorAll('[data-role-of]').forEach((sel) => sel.addEventListener('change', () => changeAdminRole(sel.dataset.roleOf, sel.value)));
+  $('a-rows').querySelectorAll('[data-rm-admin]').forEach((b) => b.addEventListener('click', () => removeAdmin(b.dataset.rmAdmin)));
+}
+
+$('admin-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const email = $('m-email').value.trim().toLowerCase();
+  const name = $('m-name').value.trim();
+  const role = $('m-role').value;
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return toast('Gmail 格式不正確', 'error');
+  if (ADMIN_EMAILS.map((x) => x.toLowerCase()).includes(email)) return toast('這個帳號已經是最高管理者', 'error');
+  const exist = adminList.find((a) => a.id === email);
+  if (exist && !confirm(`${email} 已經是${ROLE_LABEL[exist.role]}，要改成「${name}／${ROLE_LABEL[role]}」嗎？`)) return;
+  try {
+    await setDoc(doc(db, 'admins', email), { email, name, role, addedAt: serverTimestamp(), addedBy: state.me.email });
+    toast(`已新增 ${name}（${ROLE_LABEL[role]}）`, 'success');
+    log(exist ? '修改管理員' : '新增管理員', `${name}（${email}）：${ROLE_LABEL[role]}`);
+    $('m-email').value = '';
+    $('m-name').value = '';
+  } catch (err) {
+    console.error(err);
+    toast(denyMsg(err) || '新增失敗：' + err.code, 'error');
+  }
+});
+
+async function changeAdminRole(id, role) {
+  const a = adminList.find((x) => x.id === id);
+  if (!a || a.role === role) return;
+  if (!confirm(`把 ${a.name || id} 改成「${ROLE_LABEL[role]}」？`)) { renderAdmins(); return; }
+  try {
+    await updateDoc(doc(db, 'admins', id), { role });
+    toast('已更新角色', 'success');
+    log('修改管理員', `${a.name || ''}（${id}）：${ROLE_LABEL[a.role]} → ${ROLE_LABEL[role]}`);
+  } catch (err) {
+    console.error(err);
+    toast(denyMsg(err) || '更新失敗：' + err.code, 'error');
+    renderAdmins();
+  }
+}
+
+async function removeAdmin(id) {
+  const a = adminList.find((x) => x.id === id);
+  if (!confirm(`確定移除 ${a?.name || id} 的後台權限？\n對方會立刻無法操作後台。`)) return;
+  try {
+    const batch = writeBatch(db);
+    batch.delete(doc(db, 'admins', id));
+    await batch.commit();
+    toast('已移除', 'success');
+    log('移除管理員', `${a?.name || ''}（${id}，原為${ROLE_LABEL[a?.role] || ''}）`);
+  } catch (err) {
+    console.error(err);
+    toast(denyMsg(err) || '移除失敗：' + err.code, 'error');
+  }
 }

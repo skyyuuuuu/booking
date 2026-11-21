@@ -1,13 +1,19 @@
 rules_version = '2';
 
 // ============================================================
-// 常態班級劃位系統 Firestore 安全規則
+// 常態班級劃位系統 Firestore 安全規則（角色版）
 // 部署方式：Firebase Console → Firestore Database → 規則 → 整份貼上 → 發布
-// ⚠️ 請把下面 isAdmin() 裡的 email 改成你的管理員 Gmail（可放多個）
+// ⚠️ 請把下面 isOwner() 裡的 email 改成你的 Gmail（最高管理者，可放多個）
+//    其他管理員（主管、櫃台）不用寫在這裡，直接在後台「管理員帳號」頁新增
 // ============================================================
 //
-// 學生代碼（key）= 家長手機 + "_" + 學生姓名，例如 0912345678_王小明
-// 家長輸入姓名＋手機，系統組出 key 去比對名單；知道 key 才能劃位、換位、取消。
+// 角色：
+//   最高管理者（owner）：寫在下面 isOwner() 裡；可以管理管理員帳號，以及所有功能
+//   主管（manager）    ：建班、編輯、刪班、批次建立、教室範本、整份匯入、移出學生、開放／關閉、看操作紀錄
+//   櫃台（staff）      ：看班級與名單、代排／換位／取消座位、加入學生、列印、匯出
+//
+// 學生代碼（key）= 繳費序號 + "_" + 學生姓名，例如 A115001_王小明
+// 家長輸入學生姓名＋繳費序號，系統組出 key 去比對名單；知道 key 才能劃位、換位、取消。
 
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -15,32 +21,73 @@ service cloud.firestore {
     function signedIn() {
       return request.auth != null;
     }
-
-    function isAdmin() {
+    function myEmail() {
       // 用 get() 讀取，匿名使用者沒有 email 欄位時才不會出錯
-      return signedIn()
-        && request.auth.token.get('email_verified', false) == true
-        && request.auth.token.get('email', '') in [
-          'YOUR_ADMIN_EMAIL@gmail.com'
-        ];
+      return request.auth.token.get('email', '');
+    }
+    function verified() {
+      return signedIn() && request.auth.token.get('email_verified', false) == true;
     }
 
-    // ---------- 教室座位範本：只有管理員能看、能改 ----------
+    function isOwner() {
+      return verified() && myEmail() in [
+        'YOUR_ADMIN_EMAIL@gmail.com'
+      ];
+    }
+    function adminPath() {
+      return /databases/$(database)/documents/admins/$(myEmail());
+    }
+    function hasRole(roles) {
+      return verified() && myEmail() != '' && exists(adminPath()) && get(adminPath()).data.role in roles;
+    }
+    function isManager() {
+      return isOwner() || hasRole(['manager']);
+    }
+    function isStaff() {
+      return isOwner() || hasRole(['manager', 'staff']);
+    }
+
+    // ---------- 管理員帳號：只有最高管理者能新增、修改、移除 ----------
+    // 文件 ID = 管理員的 Gmail（小寫）
+    match /admins/{email} {
+      allow get: if isOwner() || (verified() && myEmail() == email);
+      allow list: if isOwner();
+      allow create, update: if isOwner()
+        && request.resource.data.role in ['manager', 'staff']
+        && request.resource.data.email == email;
+      allow delete: if isOwner();
+    }
+
+    // ---------- 操作紀錄：管理員只能新增自己的紀錄，不能修改或刪除 ----------
+    match /logs/{id} {
+      allow read: if isManager();
+      allow create: if isStaff()
+        && request.resource.data.keys().hasOnly(['at', 'by', 'byName', 'role', 'action', 'summary', 'classId', 'classTitle'])
+        && request.resource.data.by == myEmail()
+        && request.resource.data.at == request.time
+        && request.resource.data.summary is string
+        && request.resource.data.summary.size() <= 2000;
+      allow update, delete: if false;
+    }
+
+    // ---------- 教室座位範本 ----------
     match /rooms/{rid} {
-      allow read, write: if isAdmin();
+      allow read: if isStaff();
+      allow write: if isManager();
     }
 
     // ---------- 學生索引：這個學生上哪些班 ----------
-    // 只能用完整的 key 讀單筆（等於要知道姓名＋手機），不能列出全部
+    // 只能用完整的 key 讀單筆（等於要知道姓名＋繳費序號），不能列出全部
     match /students/{key} {
       allow get: if true;
-      allow list, write: if isAdmin();
+      allow list: if isStaff();
+      allow write: if isStaff();
     }
 
     // ---------- 班級 ----------
     match /classes/{cid} {
       allow read: if true;
-      allow write: if isAdmin();
+      allow write: if isManager();
 
       function cls() {
         return get(/databases/$(database)/documents/classes/$(cid)).data;
@@ -52,42 +99,44 @@ service cloud.firestore {
         return signedIn() && cls().open == true;
       }
 
-      // 學生名單：只有管理員看得到
+      // 學生名單：管理員才看得到；櫃台可以加人、更新手機，移出學生要主管
       match /roster/{key} {
-        allow read, write: if isAdmin();
+        allow read, create, update: if isStaff();
+        allow delete: if isManager();
       }
 
       // 座位（公開）：文件存在 = 已被劃走，只存一個無意義的劃位編號，不含個資
       match /seats/{seatId} {
         allow read: if true;
 
-        allow create: if isAdmin() || (canEdit()
+        allow create: if isStaff() || (canEdit()
           && seatId in cls().seats
           && request.resource.data.keys().hasOnly(['bid', 'bookedAt'])
           && request.resource.data.bookedAt == request.time
           && getAfter(sub('bookings', request.resource.data.bid)).data.seatId == seatId);
 
-        allow delete: if isAdmin() || (canEdit()
+        allow delete: if isStaff() || (canEdit()
           && !existsAfter(sub('bookings', resource.data.bid)));
 
         allow update: if false;
       }
 
-      // 劃位紀錄（含姓名、手機）：只有管理員讀得到
+      // 劃位紀錄（含姓名、繳費序號）：只有管理員讀得到
       match /bookings/{bid} {
-        allow read: if isAdmin();
+        allow read: if isStaff();
 
-        allow create: if isAdmin() || (canEdit()
-          && request.resource.data.keys().hasOnly(['key', 'seatId', 'name', 'phone', 'bookedAt'])
-          && request.resource.data.keys().hasAll(['key', 'seatId', 'name', 'phone', 'bookedAt'])
-          && request.resource.data.key == request.resource.data.phone + '_' + request.resource.data.name
+        allow create: if isStaff() || (canEdit()
+          && request.resource.data.keys().hasOnly(['key', 'seatId', 'name', 'serial', 'bookedAt'])
+          && request.resource.data.keys().hasAll(['key', 'seatId', 'name', 'serial', 'bookedAt'])
+          && request.resource.data.serial.matches('^[A-Z0-9-]{3,30}$')
+          && request.resource.data.key == request.resource.data.serial + '_' + request.resource.data.name
           // 必須在這個班的名單裡
           && exists(sub('roster', request.resource.data.key))
           && request.resource.data.bookedAt == request.time
           && getAfter(sub('seats', request.resource.data.seatId)).data.bid == bid
           && getAfter(sub('holders', request.resource.data.key)).data.bid == bid);
 
-        allow delete: if isAdmin() || (canEdit()
+        allow delete: if isStaff() || (canEdit()
           && !existsAfter(sub('seats', resource.data.seatId))
           && (!existsAfter(sub('holders', resource.data.key))
               || getAfter(sub('holders', resource.data.key)).data.bid != bid));
@@ -99,23 +148,23 @@ service cloud.firestore {
       // 文件 ID = 學生 key，所以同一個學生不可能同時佔兩個位子
       match /holders/{key} {
         allow get: if true;
-        allow list: if isAdmin();
+        allow list: if isStaff();
 
         // 第一次劃位
-        allow create: if isAdmin() || (canEdit()
+        allow create: if isStaff() || (canEdit()
           && request.resource.data.keys().hasOnly(['bid', 'seatId'])
           && getAfter(sub('bookings', request.resource.data.bid)).data.key == key
           && getAfter(sub('bookings', request.resource.data.bid)).data.seatId == request.resource.data.seatId);
 
         // 換位：舊的劃位紀錄必須在同一次操作中刪掉
-        allow update: if isAdmin() || (canEdit()
+        allow update: if isStaff() || (canEdit()
           && request.resource.data.keys().hasOnly(['bid', 'seatId'])
           && getAfter(sub('bookings', request.resource.data.bid)).data.key == key
           && getAfter(sub('bookings', request.resource.data.bid)).data.seatId == request.resource.data.seatId
           && !existsAfter(sub('bookings', resource.data.bid)));
 
         // 取消
-        allow delete: if isAdmin() || (canEdit()
+        allow delete: if isStaff() || (canEdit()
           && !existsAfter(sub('bookings', resource.data.bid)));
       }
     }

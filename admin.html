@@ -13,6 +13,7 @@
     <h1>劃位後台</h1>
     <div id="user-box" class="user-box hidden">
       <span id="user-email" class="small"></span>
+      <span id="user-role" class="role-badge"></span>
       <button type="button" id="btn-logout" class="btn small">登出</button>
     </div>
   </header>
@@ -39,13 +40,71 @@
         <div class="btn-group">
           <select id="f-branch" class="inline-select"></select>
           <button type="button" id="btn-copy-site" class="btn">複製家長劃位網址</button>
-          <button type="button" id="btn-rooms" class="btn">教室座位範本</button>
-          <button type="button" id="btn-batch" class="btn">批次建立班級</button>
-          <button type="button" id="btn-import" class="btn">整份名冊匯入</button>
-          <button type="button" id="btn-new" class="btn primary">＋ 新增班級</button>
+          <button type="button" id="btn-admins" class="btn" data-min="owner">管理員帳號</button>
+          <button type="button" id="btn-logs" class="btn" data-min="manager">操作紀錄</button>
+          <button type="button" id="btn-rooms" class="btn" data-min="manager">教室座位範本</button>
+          <button type="button" id="btn-batch" class="btn" data-min="manager">批次建立班級</button>
+          <button type="button" id="btn-import" class="btn" data-min="manager">整份名冊匯入</button>
+          <button type="button" id="btn-new" class="btn primary" data-min="manager">＋ 新增班級</button>
         </div>
       </div>
       <div id="admin-class-list" class="card-list"></div>
+    </section>
+
+    <!-- 操作紀錄 -->
+    <section id="view-logs" class="hidden">
+      <button type="button" class="btn-link js-back">← 回班級列表</button>
+      <div class="toolbar">
+        <h2 class="section-title">操作紀錄</h2>
+        <div class="btn-group">
+          <select id="l-who" class="inline-select"></select>
+          <input id="l-q" type="search" class="inline-select" placeholder="搜尋班級、學生、動作…">
+          <button type="button" id="l-export" class="btn">匯出 CSV</button>
+        </div>
+      </div>
+      <p class="muted small">記錄所有管理員在後台做過的操作，紀錄無法修改或刪除。家長自己劃位、換位不會記在這裡（可以在各班名單看到目前的座位）。</p>
+      <table class="table">
+        <thead><tr><th>時間</th><th>人員</th><th>動作</th><th>內容</th></tr></thead>
+        <tbody id="l-rows"></tbody>
+      </table>
+      <div class="center" style="margin-top:12px"><button type="button" id="l-more" class="btn">載入更早的紀錄</button></div>
+    </section>
+
+    <!-- 管理員帳號 -->
+    <section id="view-admins" class="hidden">
+      <button type="button" class="btn-link js-back">← 回班級列表</button>
+      <h2 class="section-title">管理員帳號</h2>
+      <div class="detail-grid">
+        <div class="panel">
+          <h3>目前的管理員</h3>
+          <table class="table">
+            <thead><tr><th>姓名</th><th>Gmail</th><th>角色</th><th></th></tr></thead>
+            <tbody id="a-rows"></tbody>
+          </table>
+        </div>
+        <form id="admin-form" class="panel">
+          <h3>新增管理員</h3>
+          <label>姓名
+            <input id="m-name" type="text" maxlength="20" required placeholder="例：培英櫃台 小美">
+          </label>
+          <label>Gmail（對方要用這個帳號登入）
+            <input id="m-email" type="email" required placeholder="example@gmail.com">
+          </label>
+          <label>角色
+            <select id="m-role">
+              <option value="staff">櫃台</option>
+              <option value="manager">主管</option>
+            </select>
+          </label>
+          <ul class="small muted tight">
+            <li><b>櫃台</b>：看班級和名單、代排／換位／取消座位、加入學生、列印座位表、匯出名單</li>
+            <li><b>主管</b>：櫃台的所有功能，再加上建班、編輯、刪班、批次建立、教室範本、整份名冊匯入、移出學生、開放／關閉劃位、查看操作紀錄</li>
+          </ul>
+          <button type="submit" class="btn primary block">新增</button>
+          <p class="muted small">新增後，請對方用這個 Gmail 打開後台網址並按「使用 Google 登入」。要移除權限，按名單上的「移除」即可，對方會立刻無法操作。</p>
+          <p class="muted small">最高管理者寫在 Firebase 安全規則裡，不能在這裡修改。</p>
+        </form>
+      </div>
     </section>
 
     <!-- 教室座位範本 -->
@@ -143,7 +202,7 @@
       <button type="button" class="btn-link js-back">← 回班級列表</button>
       <h2 class="section-title">整份名冊匯入</h2>
       <div class="panel">
-        <p class="small">從名冊選取「學生姓名、家長手機、班級」三欄複製，貼在下面。含標題列也沒關係。系統會依<b>班級名稱</b>把學生分到各班。</p>
+        <p class="small">從名冊選取「學生姓名、繳費序號、家長手機、班級」四欄複製，貼在下面。含標題列也沒關係。系統會依<b>班級名稱</b>把學生分到各班。</p>
         <ul class="small muted tight">
           <li>班級名稱要和後台的班級名稱一樣（空白、大小寫不影響）。</li>
           <li>同一位學生上多個班：寫成多列，或在班級欄用「、」分隔。</li>
@@ -158,7 +217,7 @@
           </label>
         </div>
         <p class="small muted">第一次使用、或想先把系統裡現有的名單倒回名冊：<button type="button" id="btn-export-all" class="btn small">匯出目前系統名冊（依上面的學期／分校）</button></p>
-        <textarea id="i-text" rows="10" placeholder="學生姓名	家長手機	班級&#10;王小明	0912345678	高一數學A班&#10;王小明	0912345678	高一英文&#10;李大華	0987654321	高一數學A班、高一英文"></textarea>
+        <textarea id="i-text" rows="10" placeholder="學生姓名	繳費序號	家長手機	班級&#10;王小明	A115001	0912345678	高一數學A班&#10;王小明	A115001	0912345678	高一英文&#10;李大華	A115002		高一數學A班、高一英文"></textarea>
         <p id="i-status" class="muted small"></p>
       </div>
 
@@ -240,7 +299,7 @@
       <div class="toolbar">
         <div id="d-stat"></div>
         <div class="btn-group">
-          <button type="button" id="d-toggle" class="btn"></button>
+          <button type="button" id="d-toggle" class="btn" data-min="manager"></button>
           <button type="button" id="d-print" class="btn">列印座位表</button>
           <button type="button" id="d-export" class="btn">匯出 CSV</button>
         </div>
@@ -256,15 +315,15 @@
             <label class="check inline"><input id="d-only-todo" type="checkbox"> 只看未劃位</label>
           </div>
           <table class="table">
-            <thead><tr><th>姓名</th><th>家長手機</th><th>座位</th><th></th></tr></thead>
+            <thead><tr><th>姓名</th><th>繳費序號</th><th>家長手機</th><th>座位</th><th></th></tr></thead>
             <tbody id="d-rows"></tbody>
           </table>
         </div>
 
         <div class="panel">
           <h3>加入學生</h3>
-          <p class="muted small">一行一位，格式：<b>姓名、手機</b>（中間用逗號、空白或 Tab 隔開）。可以直接從 Google 試算表選取「姓名」「手機」兩欄複製貼上。</p>
-          <textarea id="d-import" rows="8" placeholder="王小明	0912345678&#10;李大華, 0987654321"></textarea>
+          <p class="muted small">一行一位，順序：<b>學生姓名、繳費序號、家長手機</b>（手機可以不填；中間用 Tab、逗號或空白隔開）。可以直接從名冊選取前三欄複製貼上。</p>
+          <textarea id="d-import" rows="8" placeholder="王小明	A115001	0912345678&#10;李大華, A115002"></textarea>
           <p id="d-import-preview" class="muted small"></p>
           <button type="button" id="d-import-btn" class="btn primary block">加入名單</button>
         </div>
