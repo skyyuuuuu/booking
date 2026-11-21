@@ -11,7 +11,9 @@ import {
 import { ADMIN_EMAILS, BRANCHES } from './firebase-config.js';
 
 const $ = (id) => document.getElementById(id);
-const VIEWS = ['view-login', 'view-denied', 'view-list', 'view-editor', 'view-detail', 'view-import', 'view-batch', 'view-rooms', 'view-room-editor', 'view-logs', 'view-admins'];
+const VIEWS = ['view-login', 'view-denied', 'view-list', 'view-editor', 'view-detail', 'view-import', 'view-batch', 'view-rooms', 'view-room-editor', 'view-logs', 'view-admins', 'view-students', 'view-student-editor', 'view-profile-import'];
+const STATUS_LABEL = { active: '在學', paused: '暫停', left: '退班' };
+const GRADES = ['小一', '小二', '小三', '小四', '小五', '小六', '國一', '國二', '國三', '高一', '高二', '高三', '其他'];
 const ROLE_LABEL = { owner: '最高管理者', manager: '主管', staff: '櫃台' };
 
 const state = {
@@ -28,6 +30,12 @@ const state = {
   disabled: new Set(),
   assignSeat: null,
   me: null,                  // { email, name, role }
+  profiles: new Map(),       // 學生資料：serial -> profile
+  profilesLoaded: false,
+  editingSerial: null,       // 編輯中的學生（null = 新增）
+  editSel: new Set(),        // 編輯中勾選的班級
+  editOrig: new Set(),
+  editSeats: new Map(),      // cid -> 座位代號
   adminsUnsub: null,
   logLimit: 200,
   logs: [],
@@ -255,6 +263,7 @@ async function deleteClass(c) {
   try {
     const roster = await getDocs(collection(db, 'classes', c.id, 'roster'));
     const ops = roster.docs.map((d) => (b) => b.set(doc(db, 'students', d.id), { classes: arrayRemove(c.id) }, { merge: true }));
+    roster.docs.forEach((d) => ops.push(...profileRemoveClassOp(d.data().serial, c.id)));
     for (const sub of ['seats', 'bookings', 'holders', 'roster']) {
       const snap = sub === 'roster' ? roster : await getDocs(collection(db, 'classes', c.id, sub));
       snap.docs.forEach((d) => ops.push((b) => b.delete(d.ref)));
@@ -474,7 +483,7 @@ function renderDetail() {
     .sort((a, b) => (a.holder ? 1 : 0) - (b.holder ? 1 : 0) || a.name.localeCompare(b.name, 'zh-Hant'));
   $('d-rows').innerHTML = rows.length ? rows.map((r) => `
     <tr>
-      <td>${escapeHtml(r.name)}</td>
+      <td>${r.serial ? `<button type="button" class="name-link" data-profile="${escapeHtml(r.serial)}" title="打開學生資料">${escapeHtml(r.name)}</button>` : escapeHtml(r.name)}</td>
       <td>${r.serial ? escapeHtml(r.serial) : '<span class="warn small">舊資料，請重新匯入</span>'}</td>
       <td>${escapeHtml(r.phone || '')}</td>
       <td>${r.holder ? `<span class="seat-tag">${escapeHtml(r.holder.seatId)}</span>` : '<span class="status todo">未劃位</span>'}</td>
@@ -543,7 +552,9 @@ async function removeStudent(key) {
     const batch = writeBatch(db);
     batch.delete(doc(db, 'classes', state.cid, 'roster', key));
     batch.set(doc(db, 'students', key), { classes: arrayRemove(state.cid) }, { merge: true });
+    profileRemoveClassOp(s.serial, state.cid).forEach((fn) => fn(batch));
     await batch.commit();
+    state.profilesLoaded = false;
     toast(`已移出 ${s.name}`, 'success');
     log('移出學生', `把 ${s.name}（${s.serial || '無序號'}）移出班級${h ? `，釋放座位 ${h.seatId}` : ''}`, state.detail);
   } catch (err) {
@@ -619,7 +630,7 @@ function updateImportPreview() {
   if (fresh.length) parts.push(`將加入 <b>${fresh.length}</b> 位`);
   if (dup) parts.push(`${dup} 位已在名單中（略過）`);
   if (bad.length) parts.push(`<span class="warn">無法辨識 ${bad.length} 行：${bad.slice(0, 3).map(escapeHtml).join('／')}${bad.length > 3 ? '…' : ''}</span>`);
-  if (conflicts.length) parts.push(`<span class="warn">⚠️ 同一個繳費序號對到不同姓名，請確認是否打錯字：${conflicts.map(escapeHtml).join('／')}</span>`);
+  if (conflicts.length) parts.push(`<span class="warn">⚠️ 同一個繳費序號對到不同姓名，只會加入第一個（或名單上原本的）姓名，請確認是否打錯字：${conflicts.map(escapeHtml).join('／')}</span>`);
   if (notes.length) parts.push(`<span class="warn">${notes.map(escapeHtml).join('／')}</span>`);
   $('d-import-preview').innerHTML = parts.join('<br>');
   return fresh;
@@ -629,20 +640,48 @@ $('d-import').addEventListener('input', updateImportPreview);
 
 function addStudentOps(cid, name, serial, phone = '') {
   const key = studentKey(name, serial);
+  const profile = { serial, name, classes: arrayUnion(cid), updatedAt: serverTimestamp() };
+  if (phone) profile.phone = phone;
   return [
-    // 家長手機只存在名單（只有管理員看得到），不放進公開的學生索引
+    // 家長手機只存在名單和學生資料（只有管理員看得到），不放進公開的學生索引
     (b) => b.set(doc(db, 'classes', cid, 'roster', key), { name, serial, phone: phone || '', addedAt: serverTimestamp() }),
-    (b) => b.set(doc(db, 'students', key), { name, serial, classes: arrayUnion(cid) }, { merge: true })
+    (b) => b.set(doc(db, 'students', key), { name, serial, classes: arrayUnion(cid) }, { merge: true }),
+    (b) => b.set(doc(db, 'profiles', serial), profile, { merge: true })
   ];
 }
 
+// 從班級移出時，同步學生資料上的班級清單
+function profileRemoveClassOp(serial, cid) {
+  return serial ? [(b) => b.set(doc(db, 'profiles', serial), { serial, classes: arrayRemove(cid), updatedAt: serverTimestamp() }, { merge: true })] : [];
+}
+
+// 一次讀取多個繳費序號的學生資料（只讀需要的，不讀全部）
+async function fetchProfiles(serials) {
+  const uniq = [...new Set(serials.filter(Boolean))];
+  const snaps = await Promise.all(uniq.map((sn) => getDoc(doc(db, 'profiles', sn))));
+  const m = new Map();
+  snaps.forEach((snap, i) => { if (snap.exists()) m.set(uniq[i], snap.data()); });
+  return m;
+}
+
 $('d-import-btn').addEventListener('click', async () => {
-  const fresh = updateImportPreview();
+  let fresh = updateImportPreview();
   if (!fresh.length) return toast('沒有可以加入的學生', 'error');
   const btn = $('d-import-btn');
   btn.disabled = true;
   try {
+    // 繳費序號已經屬於另一個姓名的學生 → 不加入
+    const profs = await fetchProfiles(fresh.map((x) => x.serial));
+    // 同一次貼上裡，同一個序號出現不同姓名：以第一筆為準
+    fresh.forEach((x) => { if (!profs.has(x.serial)) profs.set(x.serial, { name: x.name }); });
+    const blocked = fresh.filter((x) => profs.get(x.serial).name !== x.name);
+    fresh = fresh.filter((x) => !blocked.includes(x));
+    if (blocked.length) {
+      alert(`以下 ${blocked.length} 位沒有加入，因為繳費序號已經屬於別的學生：\n${blocked.map((x) => `${x.name}（${x.serial} 是「${profs.get(x.serial).name}」的序號）`).join('\n')}`);
+    }
+    if (!fresh.length) return;
     await commitInChunks(fresh.flatMap((s) => addStudentOps(state.cid, s.name, s.serial, s.phone)));
+    state.profilesLoaded = false;
     toast(`已加入 ${fresh.length} 位學生`, 'success');
     log('加入學生', `加入 ${fresh.length} 位：${fresh.map((x) => `${x.name}(${x.serial})`).join('、')}`, state.detail);
     $('d-import').value = '';
@@ -735,7 +774,7 @@ async function openImport() {
   $('i-branch').value = $('f-branch').value;
   $('i-preview').classList.add('hidden');
   show('view-import');
-  await loadAllRosters();
+  await Promise.all([loadAllRosters(), loadProfiles()]);
   analyzeImport();
 }
 
@@ -779,7 +818,17 @@ function parseBulk(text) {
 
 function analyzeImport() {
   if (!state.rosters) return;
-  const { rows, bad, notes } = parseBulk($('i-text').value);
+  const parsed = parseBulk($('i-text').value);
+  const { bad, notes } = parsed;
+  // 繳費序號已經屬於另一個姓名的學生 → 不匯入
+  const firstName = new Map();
+  const rows = parsed.rows.filter((r) => {
+    const p = state.profiles.get(r.serial);
+    if (p && p.name !== r.name) { bad.push(`${r.name} ${r.serial}（這個序號已經是「${p.name}」的）`); return false; }
+    if (!firstName.has(r.serial)) firstName.set(r.serial, r.name);
+    if (firstName.get(r.serial) !== r.name) { bad.push(`${r.name} ${r.serial}（名冊裡同一個序號前面寫的是「${firstName.get(r.serial)}」）`); return false; }
+    return true;
+  });
   if (!rows.length && !bad.length) {
     $('i-preview').classList.add('hidden');
     state.plan = null;
@@ -893,10 +942,12 @@ async function runImport() {
           }
           ops.push((b) => b.delete(doc(db, 'classes', p.cid, 'roster', s.key)));
           ops.push((b) => b.set(doc(db, 'students', s.key), { classes: arrayRemove(p.cid) }, { merge: true }));
+          ops.push(...profileRemoveClassOp(s.serial, p.cid));
         });
       }
     }
     await commitInChunks(ops);
+    state.profilesLoaded = false;
     toast(`匯入完成：新加入 ${addTotal} 筆${updTotal ? `、更新手機 ${updTotal} 筆` : ''}${rmTotal ? `、移出 ${rmTotal} 筆` : ''}`, 'success');
     for (const p of plan) {
       const parts = [];
@@ -1492,3 +1543,459 @@ async function removeAdmin(id) {
     toast(denyMsg(err) || '移除失敗：' + err.code, 'error');
   }
 }
+
+// ---------- 學生資料（總名單） ----------
+const statusPill = (st) => `<span class="status-pill ${st || 'active'}">${STATUS_LABEL[st || 'active']}</span>`;
+const fillSelect = (el, first, items, cur) => {
+  el.innerHTML = (first !== null ? [`<option value="">${first}</option>`] : [])
+    .concat(items.map((x) => `<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`)).join('');
+  if (cur !== undefined) {
+    if (cur && !items.includes(cur)) el.insertAdjacentHTML('beforeend', `<option value="${escapeHtml(cur)}">${escapeHtml(cur)}</option>`);
+    el.value = cur || '';
+  }
+};
+
+async function loadProfiles(force = false) {
+  if (state.profilesLoaded && !force) return;
+  const snap = await getDocs(collection(db, 'profiles'));
+  state.profiles = new Map(snap.docs.map((d) => [d.id, d.data()]));
+  state.profilesLoaded = true;
+}
+
+$('btn-students').addEventListener('click', openStudents);
+document.querySelectorAll('.js-back-students').forEach((b) => b.addEventListener('click', openStudents));
+['sf-q', 'sf-status', 'sf-branch', 'sf-grade'].forEach((id) => $(id).addEventListener('input', renderStudents));
+
+async function openStudents() {
+  if (!$('sf-branch').options.length) {
+    fillSelect($('sf-branch'), '全部分校', BRANCHES);
+    fillSelect($('sf-grade'), '全部年級', GRADES);
+  }
+  show('view-students');
+  $('s-rows').innerHTML = '<tr><td colspan="7" class="muted center">讀取中…</td></tr>';
+  try {
+    await loadProfiles(true);
+    renderStudents();
+  } catch (err) {
+    console.error(err);
+    $('s-rows').innerHTML = `<tr><td colspan="7" class="warn center">讀取失敗：${escapeHtml(denyMsg(err) || err.code || err.message)}</td></tr>`;
+  }
+}
+
+function classTitlesOf(p) {
+  return (p.classes || []).map((cid) => state.classes.find((c) => c.id === cid)).filter(Boolean);
+}
+
+function filteredProfiles() {
+  const q = $('sf-q').value.trim().toLowerCase();
+  const st = $('sf-status').value;
+  const br = $('sf-branch').value;
+  const gr = $('sf-grade').value;
+  return [...state.profiles.values()].filter((p) => (!st || (p.status || 'active') === st)
+    && (!br || p.branch === br) && (!gr || p.grade === gr)
+    && (!q || [p.name, p.serial, p.phone, p.school, p.note].join(' ').toLowerCase().includes(q)))
+    .sort((a, b) => String(a.name).localeCompare(String(b.name), 'zh-Hant') || String(a.serial).localeCompare(String(b.serial)));
+}
+
+function renderStudents() {
+  const all = filteredProfiles();
+  const list = all.slice(0, 300);
+  $('s-count').textContent = `（共 ${state.profiles.size} 位${all.length !== state.profiles.size ? `，符合 ${all.length} 位` : ''}）`;
+  $('s-rows').innerHTML = list.length ? list.map((p) => {
+    const cls = classTitlesOf(p);
+    return `
+    <tr data-serial="${escapeHtml(p.serial)}">
+      <td><b>${escapeHtml(p.name)}</b></td>
+      <td>${escapeHtml(p.serial)}</td>
+      <td class="small">${escapeHtml([p.school, p.grade].filter(Boolean).join(' '))}</td>
+      <td class="small">${escapeHtml(p.branch || '')}</td>
+      <td class="small">${escapeHtml(p.phone || '')}</td>
+      <td class="class-list-cell">${cls.length ? `${cls.length} 班：${cls.map((c) => escapeHtml(c.title)).join('、')}` : '—'}</td>
+      <td>${statusPill(p.status)}</td>
+    </tr>`;
+  }).join('') : `<tr><td colspan="7" class="muted center">${state.profiles.size ? '沒有符合的學生' : '還沒有學生資料。可以按「新增學生」、「匯入學生資料」，或用「從現有班級名單建立」把各班名單裡的學生建成資料。'}</td></tr>`;
+  $('s-more').textContent = all.length > list.length ? `只顯示前 ${list.length} 位，請用搜尋或篩選縮小範圍。` : '';
+  $('s-rows').querySelectorAll('tr[data-serial]').forEach((tr) => tr.addEventListener('click', () => openStudentEditor(tr.dataset.serial)));
+}
+
+$('btn-new-student').addEventListener('click', () => openStudentEditor(null));
+
+async function openStudentEditor(serial) {
+  if (!state.profilesLoaded) await loadProfiles();
+  const p = serial ? state.profiles.get(serial) : null;
+  if (serial && !p) return toast('找不到這位學生的資料', 'error');
+  state.editingSerial = p ? p.serial : null;
+  $('se-title').textContent = p ? `編輯學生：${p.name}` : '新增學生';
+  $('se-name').value = p?.name || '';
+  $('se-serial').value = p?.serial || '';
+  $('se-phone').value = p?.phone || '';
+  $('se-status').value = p?.status || 'active';
+  $('se-school').value = p?.school || '';
+  fillSelect($('se-grade'), '（未填）', GRADES, p?.grade || '');
+  fillSelect($('se-branch'), '（未填）', BRANCHES, p?.branch || '');
+  $('se-note').value = p?.note || '';
+  const lock = !!p && !can('manager');
+  $('se-name').disabled = lock;
+  $('se-serial').disabled = lock;
+  $('se-lock-note').classList.toggle('hidden', !lock);
+  $('se-delete').classList.toggle('hidden', !p);
+
+  const terms = [...new Set(state.classes.map((c) => c.term).filter(Boolean))].sort().reverse();
+  fillSelect($('se-term'), '全部學期', terms, terms[0] || '');
+  $('se-class-q').value = '';
+  $('se-only-mine').checked = false;
+  const valid = new Set(state.classes.map((c) => c.id));
+  state.editOrig = new Set((p?.classes || []).filter((cid) => valid.has(cid)));
+  state.editSel = new Set(state.editOrig);
+  state.editSeats = new Map();
+  renderClassPicker();
+  show('view-student-editor');
+
+  // 讀取目前各班的座位
+  if (p) {
+    const key = studentKey(p.name, p.serial);
+    await Promise.all([...state.editOrig].map(async (cid) => {
+      try {
+        const h = await getDoc(doc(db, 'classes', cid, 'holders', key));
+        if (h.exists()) state.editSeats.set(cid, h.data().seatId);
+      } catch (e) { /* 忽略 */ }
+    }));
+    renderClassPicker();
+  }
+}
+
+['se-term', 'se-class-q', 'se-only-mine'].forEach((id) => $(id).addEventListener('input', renderClassPicker));
+
+function renderClassPicker() {
+  const term = $('se-term').value;
+  const q = normTitle($('se-class-q').value);
+  const onlyMine = $('se-only-mine').checked;
+  const list = state.classes.filter((c) => (state.editSel.has(c.id) || !term || c.term === term)
+    && (!q || normTitle(c.title).includes(q)) && (!onlyMine || state.editSel.has(c.id)));
+  const staffLock = !can('manager');
+  $('se-classes').innerHTML = list.length ? list.map((c) => {
+    const on = state.editSel.has(c.id);
+    const locked = staffLock && state.editOrig.has(c.id);
+    const seat = state.editSeats.get(c.id);
+    return `<label class="${on ? 'on' : ''} ${locked ? 'locked' : ''}" title="${locked ? '移出班級要主管操作' : ''}">
+      <input type="checkbox" data-cid="${c.id}" ${on ? 'checked' : ''} ${locked ? 'disabled' : ''}>
+      <span><b>${escapeHtml(c.title)}</b>${seat ? ` <span class="seat-tag">${escapeHtml(seat)}</span>` : ''}
+        <div class="meta">${escapeHtml(classMeta(c))}</div></span></label>`;
+  }).join('') : '<p class="muted small">沒有符合的班級</p>';
+  $('se-classes').querySelectorAll('input[data-cid]').forEach((cb) => cb.addEventListener('change', () => {
+    if (cb.checked) state.editSel.add(cb.dataset.cid); else state.editSel.delete(cb.dataset.cid);
+    renderClassPicker();
+  }));
+  const added = [...state.editSel].filter((x) => !state.editOrig.has(x)).length;
+  const removed = [...state.editOrig].filter((x) => !state.editSel.has(x)).length;
+  $('se-class-note').textContent = `已勾選 ${state.editSel.size} 班${added ? `，將加入 ${added} 班` : ''}${removed ? `，將移出 ${removed} 班（有座位的會釋放）` : ''}${staffLock && state.editOrig.size ? '。移出班級要主管操作。' : ''}`;
+}
+
+$('student-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const old = state.editingSerial ? state.profiles.get(state.editingSerial) : null;
+  const name = normalizeName($('se-name').value);
+  const serial = normalizeSerial($('se-serial').value);
+  let phone = normalizePhone($('se-phone').value);
+  if (/^9\d{8}$/.test(phone)) phone = '0' + phone;
+  if (!name || name.length > 20 || /\d/.test(name)) return toast('請填寫正確的學生姓名', 'error');
+  if (!isValidSerial(serial)) return toast('繳費序號格式不對（只能有英文字母、數字、-，3～30 字）', 'error');
+  if (phone && !isValidPhone(phone)) return toast('家長手機格式不對，請輸入 09 開頭的 10 碼，或留空', 'error');
+  const status = $('se-status').value;
+  const sel = new Set(state.editSel);
+
+  // 序號不能重複
+  if (!old || old.serial !== serial) {
+    const taken = await getDoc(doc(db, 'profiles', serial));
+    if (taken.exists()) return toast(`繳費序號 ${serial} 已經是「${taken.data().name}」的了`, 'error');
+  }
+  // 改成退班時，主管可以選擇一起移出所有班級
+  if (status === 'left' && (old?.status || 'active') !== 'left' && sel.size && can('manager')
+    && confirm(`${name} 改成「退班」，要同時把他從目前的 ${sel.size} 個班級移出嗎？\n（有座位的會一起釋放）`)) sel.clear();
+
+  const oldKey = old ? studentKey(old.name, old.serial) : null;
+  const newKey = studentKey(name, serial);
+  const rekey = !!old && oldKey !== newKey;
+  const added = [...sel].filter((x) => !state.editOrig.has(x));
+  const removed = [...state.editOrig].filter((x) => !sel.has(x));
+  const kept = [...sel].filter((x) => state.editOrig.has(x));
+  if ((removed.length || rekey) && !can('manager')) return toast('移出班級、修改姓名或序號要主管操作', 'error');
+  if (removed.some((cid) => state.editSeats.has(cid))
+    && !confirm(`會從 ${removed.length} 個班級移出，其中有座位的會一起釋放，確定嗎？`)) return;
+
+  const btn = $('se-submit');
+  btn.disabled = true;
+  try {
+    const ops = [];
+    // 需要讀目前座位的班級：要移出的、要改名搬移的
+    const needHolder = [...removed, ...(rekey ? kept : [])];
+    const holders = new Map();
+    await Promise.all(needHolder.map(async (cid) => {
+      const h = await getDoc(doc(db, 'classes', cid, 'holders', oldKey));
+      if (h.exists()) holders.set(cid, h.data());
+    }));
+
+    removed.forEach((cid) => {
+      const h = holders.get(cid);
+      if (h) {
+        ops.push((b) => b.delete(doc(db, 'classes', cid, 'seats', h.seatId)));
+        ops.push((b) => b.delete(doc(db, 'classes', cid, 'bookings', h.bid)));
+        ops.push((b) => b.delete(doc(db, 'classes', cid, 'holders', oldKey)));
+      }
+      ops.push((b) => b.delete(doc(db, 'classes', cid, 'roster', oldKey)));
+    });
+    kept.forEach((cid) => {
+      if (rekey) {
+        ops.push((b) => b.set(doc(db, 'classes', cid, 'roster', newKey), { name, serial, phone, addedAt: serverTimestamp() }));
+        ops.push((b) => b.delete(doc(db, 'classes', cid, 'roster', oldKey)));
+        const h = holders.get(cid);
+        if (h) {
+          ops.push((b) => b.set(doc(db, 'classes', cid, 'holders', newKey), { bid: h.bid, seatId: h.seatId }));
+          ops.push((b) => b.delete(doc(db, 'classes', cid, 'holders', oldKey)));
+          ops.push((b) => b.update(doc(db, 'classes', cid, 'bookings', h.bid), { key: newKey, name, serial }));
+        }
+      } else if ((old?.phone || '') !== phone) {
+        ops.push((b) => b.set(doc(db, 'classes', cid, 'roster', oldKey), { phone }, { merge: true }));
+      }
+    });
+    added.forEach((cid) => ops.push((b) => b.set(doc(db, 'classes', cid, 'roster', newKey), { name, serial, phone, addedAt: serverTimestamp() })));
+
+    // 家長登入用的學生索引
+    if (rekey) ops.push((b) => b.delete(doc(db, 'students', oldKey)));
+    if (sel.size || rekey || added.length || removed.length) {
+      ops.push((b) => b.set(doc(db, 'students', newKey), { name, serial, classes: [...sel] }, { merge: true }));
+    }
+    // 學生資料本身
+    const data = {
+      serial, name, phone, status,
+      school: $('se-school').value.trim(), grade: $('se-grade').value, branch: $('se-branch').value,
+      note: $('se-note').value.trim(), classes: [...sel], updatedAt: serverTimestamp(), updatedBy: state.me.email
+    };
+    if (!old || old.serial !== serial) data.createdAt = old?.createdAt || serverTimestamp();
+    ops.push((b) => b.set(doc(db, 'profiles', serial), data, { merge: true }));
+    if (old && old.serial !== serial) ops.push((b) => b.delete(doc(db, 'profiles', old.serial)));
+
+    await commitInChunks(ops);
+    toast(old ? '已儲存學生資料' : `已新增 ${name}`, 'success');
+
+    const titles = (ids) => ids.map((cid) => state.classes.find((c) => c.id === cid)?.title || cid).join('、');
+    const parts = [];
+    if (!old) parts.push(`新增 ${name}（${serial}）`);
+    else {
+      parts.push(`${old.name}（${old.serial}）`);
+      if (rekey) parts.push(`改為 ${name}（${serial}）`);
+      const changed = ['phone', 'status', 'school', 'grade', 'branch', 'note'].filter((k) => String(old[k] || (k === 'status' ? 'active' : '')) !== String(data[k] || ''));
+      if (changed.length) parts.push(`修改：${changed.map((k) => ({ phone: '手機', status: '狀態', school: '學校', grade: '年級', branch: '主要分校', note: '備註' })[k]).join('、')}${changed.includes('status') ? `（${STATUS_LABEL[data.status]}）` : ''}`);
+    }
+    if (added.length) parts.push(`加入班級：${titles(added)}`);
+    if (removed.length) parts.push(`移出班級：${titles(removed)}`);
+    log(old ? '編輯學生資料' : '新增學生資料', parts.join('；'));
+    state.profilesLoaded = false;
+    openStudents();
+  } catch (err) {
+    console.error(err);
+    toast(denyMsg(err) || '儲存失敗：' + (err.code || err.message), 'error');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('se-delete').addEventListener('click', async () => {
+  const p = state.profiles.get(state.editingSerial);
+  if (!p || !can('manager')) return;
+  const cls = classTitlesOf(p);
+  if (!confirm(`確定刪除學生「${p.name}（${p.serial}）」？${cls.length ? `\n會同時從 ${cls.length} 個班級移出，座位一起釋放。` : ''}\n刪除後無法復原。`)) return;
+  try {
+    const key = studentKey(p.name, p.serial);
+    const ops = [];
+    for (const c of cls) {
+      const h = await getDoc(doc(db, 'classes', c.id, 'holders', key));
+      if (h.exists()) {
+        const d = h.data();
+        ops.push((b) => b.delete(doc(db, 'classes', c.id, 'seats', d.seatId)));
+        ops.push((b) => b.delete(doc(db, 'classes', c.id, 'bookings', d.bid)));
+        ops.push((b) => b.delete(doc(db, 'classes', c.id, 'holders', key)));
+      }
+      ops.push((b) => b.delete(doc(db, 'classes', c.id, 'roster', key)));
+    }
+    ops.push((b) => b.delete(doc(db, 'students', key)));
+    ops.push((b) => b.delete(doc(db, 'profiles', p.serial)));
+    await commitInChunks(ops);
+    toast(`已刪除 ${p.name}`, 'success');
+    log('刪除學生', `${p.name}（${p.serial}）${cls.length ? `，並移出：${cls.map((c) => c.title).join('、')}` : ''}`);
+    state.profilesLoaded = false;
+    openStudents();
+  } catch (err) {
+    console.error(err);
+    toast(denyMsg(err) || '刪除失敗：' + (err.code || err.message), 'error');
+  }
+});
+
+// 班級名單上點姓名 → 打開學生資料
+$('d-rows').addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-profile]');
+  if (!btn) return;
+  const serial = btn.dataset.profile;
+  const p = (await fetchProfiles([serial])).get(serial);
+  if (!p) return toast('這位學生還沒有學生資料，可以到「學生資料」頁按「從現有班級名單建立」', 'error');
+  state.profiles.set(serial, p);
+  state.profilesLoaded = true;
+  stopDetail();
+  openStudentEditor(serial);
+});
+
+// 從現有班級名單建立學生資料（第一次使用時）
+$('btn-migrate').addEventListener('click', async () => {
+  if (!can('manager')) return;
+  const btn = $('btn-migrate');
+  btn.disabled = true;
+  try {
+    await Promise.all([loadAllRosters(), loadProfiles(true)]);
+    const bySerial = new Map();
+    let legacy = 0;
+    state.rosters.forEach((roster, cid) => roster.forEach((r) => {
+      if (!r.serial) { legacy++; return; }
+      if (!bySerial.has(r.serial)) bySerial.set(r.serial, { names: new Set(), phone: '', classes: new Set() });
+      const x = bySerial.get(r.serial);
+      x.names.add(r.name);
+      if (!x.phone && r.phone) x.phone = r.phone;
+      x.classes.add(cid);
+    }));
+    const conflicts = [];
+    const creates = [];
+    const fixes = [];
+    bySerial.forEach((x, serial) => {
+      const names = [...x.names];
+      const p = state.profiles.get(serial);
+      if (names.length > 1 || (p && !x.names.has(p.name))) { conflicts.push(`${serial}：${[...new Set([...(p ? [p.name] : []), ...names])].join('、')}`); return; }
+      if (!p) creates.push({ serial, name: names[0], phone: x.phone, classes: [...x.classes] });
+      else {
+        const missing = [...x.classes].filter((cid) => !(p.classes || []).includes(cid));
+        if (missing.length) fixes.push({ serial, missing });
+      }
+    });
+    if (!creates.length && !fixes.length) {
+      alert(`沒有需要建立的學生資料。${conflicts.length ? `\n\n以下序號在不同班級名單裡對到不同姓名，請先到各班修正：\n${conflicts.join('\n')}` : ''}${legacy ? `\n\n另有 ${legacy} 筆舊格式（沒有繳費序號）的名單被略過。` : ''}`);
+      return;
+    }
+    if (!confirm(`將建立 ${creates.length} 位學生資料${fixes.length ? `、補上 ${fixes.length} 位學生的班級` : ''}。${conflicts.length ? `\n\n有 ${conflicts.length} 個序號對到不同姓名，不會建立：\n${conflicts.slice(0, 10).join('\n')}${conflicts.length > 10 ? '\n…' : ''}` : ''}${legacy ? `\n\n略過 ${legacy} 筆沒有繳費序號的舊資料。` : ''}\n\n確定嗎？`)) return;
+    const ops = creates.map((x) => (b) => b.set(doc(db, 'profiles', x.serial), {
+      serial: x.serial, name: x.name, phone: x.phone || '', status: 'active', school: '', grade: '', branch: '', note: '',
+      classes: x.classes, createdAt: serverTimestamp(), updatedAt: serverTimestamp(), updatedBy: state.me.email
+    }));
+    fixes.forEach((x) => ops.push((b) => b.set(doc(db, 'profiles', x.serial), { serial: x.serial, classes: arrayUnion(...x.missing), updatedAt: serverTimestamp() }, { merge: true })));
+    await commitInChunks(ops);
+    toast(`已建立 ${creates.length} 位學生資料`, 'success');
+    log('從班級名單建立學生資料', `建立 ${creates.length} 位${fixes.length ? `、補上 ${fixes.length} 位的班級` : ''}${conflicts.length ? `；${conflicts.length} 個序號姓名不一致未建立` : ''}`);
+    await openStudents();
+  } catch (err) {
+    console.error(err);
+    toast(denyMsg(err) || '建立失敗：' + (err.code || err.message), 'error');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ---------- 匯入學生資料（不含分班） ----------
+let profilePlan = [];
+$('btn-profile-import').addEventListener('click', async () => {
+  $('pi-text').value = '';
+  analyzeProfileImport();
+  show('view-profile-import');
+  await loadProfiles();
+  analyzeProfileImport();
+});
+$('pi-text').addEventListener('input', analyzeProfileImport);
+$('pi-submit').addEventListener('click', runProfileImport);
+
+const STATUS_FROM_TEXT = { '': 'active', 在學: 'active', 暫停: 'paused', 退班: 'left', active: 'active', paused: 'paused', left: 'left' };
+
+function analyzeProfileImport() {
+  const bad = [];
+  const notes = [];
+  const seen = new Set();
+  profilePlan = [];
+  String($('pi-text').value || '').split(/\r?\n/).forEach((line) => {
+    if (!line.trim()) return;
+    const f = splitFields(line);
+    if (isHeaderRow(f)) return;
+    const r = parseStudentFields(f[0], f[1], f[2]);
+    const raw = line.trim().replace(/\t/g, ' ');
+    if (r.error) { bad.push(`${raw}（${r.error}）`); return; }
+    if (seen.has(r.serial)) { bad.push(`${raw}（序號在清單裡重複）`); return; }
+    seen.add(r.serial);
+    const statusText = (f[6] || '').trim();
+    if (!(statusText in STATUS_FROM_TEXT)) { bad.push(`${raw}（狀態只能填 在學、暫停、退班）`); return; }
+    const p = state.profiles.get(r.serial);
+    if (p && p.name !== r.name) { bad.push(`${raw}（這個序號已經是「${p.name}」的）`); return; }
+    if (r.phoneNote) notes.push(`${r.name}：${r.phoneNote}`);
+    const branch = (f[5] || '').trim();
+    if (branch && !BRANCHES.includes(branch)) notes.push(`${r.name}：分校「${branch}」不在分校清單中（仍會匯入）`);
+    profilePlan.push({
+      serial: r.serial, name: r.name, phone: r.phone, school: (f[3] || '').trim(), grade: (f[4] || '').trim(),
+      branch, status: statusText ? STATUS_FROM_TEXT[statusText] : '', note: (f[7] || '').trim(), existing: p || null
+    });
+  });
+  const nNew = profilePlan.filter((x) => !x.existing).length;
+  const nUpd = profilePlan.length - nNew;
+  $('pi-status').innerHTML = profilePlan.length || bad.length ? `新增 <b>${nNew}</b> 位、更新 <b>${nUpd}</b> 位${bad.length ? `、<span class="warn">${bad.length} 列不會匯入</span>` : ''}` : '';
+  $('pi-problems').innerHTML = (bad.length ? `<div class="notice error"><b>這些資料不會匯入：</b><ul class="tight">${bad.slice(0, 30).map((x) => `<li>${escapeHtml(x)}</li>`).join('')}${bad.length > 30 ? '<li>…</li>' : ''}</ul></div>` : '')
+    + (notes.length ? `<div class="notice warn-box"><b>請確認：</b><ul class="tight">${notes.slice(0, 30).map((x) => `<li>${escapeHtml(x)}</li>`).join('')}</ul></div>` : '');
+  $('pi-submit').disabled = !profilePlan.length;
+}
+
+async function runProfileImport() {
+  if (!profilePlan.length) return;
+  const nNew = profilePlan.filter((x) => !x.existing).length;
+  if (!confirm(`確定匯入？新增 ${nNew} 位、更新 ${profilePlan.length - nNew} 位`)) return;
+  const btn = $('pi-submit');
+  btn.disabled = true;
+  try {
+    const ops = [];
+    profilePlan.forEach((x) => {
+      if (!x.existing) {
+        ops.push((b) => b.set(doc(db, 'profiles', x.serial), {
+          serial: x.serial, name: x.name, phone: x.phone, school: x.school, grade: x.grade, branch: x.branch,
+          status: x.status || 'active', note: x.note, classes: [], createdAt: serverTimestamp(), updatedAt: serverTimestamp(), updatedBy: state.me.email
+        }));
+      } else {
+        // 只更新有填的欄位，空白不蓋掉原本的資料
+        const upd = { serial: x.serial, updatedAt: serverTimestamp(), updatedBy: state.me.email };
+        ['phone', 'school', 'grade', 'branch', 'status', 'note'].forEach((k) => { if (x[k]) upd[k] = x[k]; });
+        ops.push((b) => b.set(doc(db, 'profiles', x.serial), upd, { merge: true }));
+        // 手機有改：同步到各班名單
+        if (x.phone && x.phone !== (x.existing.phone || '')) {
+          const key = studentKey(x.name, x.serial);
+          (x.existing.classes || []).forEach((cid) => ops.push((b) => b.set(doc(db, 'classes', cid, 'roster', key), { phone: x.phone }, { merge: true })));
+        }
+      }
+    });
+    await commitInChunks(ops);
+    toast(`匯入完成：新增 ${nNew} 位、更新 ${profilePlan.length - nNew} 位`, 'success');
+    log('匯入學生資料', `新增 ${nNew} 位、更新 ${profilePlan.length - nNew} 位：${profilePlan.slice(0, 50).map((x) => `${x.name}(${x.serial})`).join('、')}${profilePlan.length > 50 ? '…' : ''}`);
+    state.profilesLoaded = false;
+    openStudents();
+  } catch (err) {
+    console.error(err);
+    toast(denyMsg(err) || '匯入失敗：' + (err.code || err.message), 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$('btn-profile-export').addEventListener('click', () => {
+  const list = filteredProfiles();
+  if (!list.length) return toast('沒有可以匯出的學生', 'error');
+  const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const text = (v) => (v ? `="${String(v).replace(/"/g, '')}"` : '');
+  const lines = [['學生姓名', '繳費序號', '家長手機', '學校', '年級', '主要分校', '狀態', '備註', '上的班級'].map(cell).join(',')]
+    .concat(list.map((p) => [cell(p.name), text(p.serial), text(p.phone), cell(p.school), cell(p.grade), cell(p.branch),
+      cell(STATUS_LABEL[p.status || 'active']), cell(p.note), cell(classTitlesOf(p).map((c) => c.title).join('、'))].join(',')));
+  const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `學生資料_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  log('匯出名單', `匯出學生資料 CSV（${list.length} 位）`);
+});

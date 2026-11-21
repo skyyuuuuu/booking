@@ -70,6 +70,16 @@ service cloud.firestore {
       allow update, delete: if false;
     }
 
+    // ---------- 學生資料（總名單）：文件 ID = 繳費序號，一位學生一份 ----------
+    // 櫃台可以新增、編輯；改姓名、刪除要主管（改姓名會牽動各班名單和座位）
+    match /profiles/{serial} {
+      allow read: if isStaff();
+      allow create: if isStaff() && request.resource.data.serial == serial;
+      allow update: if isStaff() && request.resource.data.serial == serial
+        && (isManager() || request.resource.data.name == resource.data.name);
+      allow delete: if isManager();
+    }
+
     // ---------- 教室座位範本 ----------
     match /rooms/{rid} {
       allow read: if isStaff();
@@ -118,7 +128,7 @@ service cloud.firestore {
         allow delete: if isStaff() || (canEdit()
           && !existsAfter(sub('bookings', resource.data.bid)));
 
-        allow update: if false;
+        allow update: if isStaff();
       }
 
       // 劃位紀錄（含姓名、繳費序號）：只有管理員讀得到
@@ -141,7 +151,8 @@ service cloud.firestore {
           && (!existsAfter(sub('holders', resource.data.key))
               || getAfter(sub('holders', resource.data.key)).data.bid != bid));
 
-        allow update: if false;
+        // 管理員修改學生姓名、序號時，搬移劃位紀錄
+        allow update: if isStaff();
       }
 
       // 座位持有：每個學生每班只有一份，記錄他目前坐哪裡

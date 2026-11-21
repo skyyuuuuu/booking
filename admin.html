@@ -40,6 +40,7 @@
         <div class="btn-group">
           <select id="f-branch" class="inline-select"></select>
           <button type="button" id="btn-copy-site" class="btn">複製家長劃位網址</button>
+          <button type="button" id="btn-students" class="btn">學生資料</button>
           <button type="button" id="btn-admins" class="btn" data-min="owner">管理員帳號</button>
           <button type="button" id="btn-logs" class="btn" data-min="manager">操作紀錄</button>
           <button type="button" id="btn-rooms" class="btn" data-min="manager">教室座位範本</button>
@@ -49,6 +50,100 @@
         </div>
       </div>
       <div id="admin-class-list" class="card-list"></div>
+    </section>
+
+    <!-- 學生資料 -->
+    <section id="view-students" class="hidden">
+      <button type="button" class="btn-link js-back">← 回班級列表</button>
+      <div class="toolbar">
+        <h2 class="section-title">學生資料 <span id="s-count" class="muted small"></span></h2>
+        <div class="btn-group">
+          <button type="button" id="btn-migrate" class="btn" data-min="manager">從現有班級名單建立</button>
+          <button type="button" id="btn-profile-import" class="btn">匯入學生資料</button>
+          <button type="button" id="btn-profile-export" class="btn">匯出 CSV</button>
+          <button type="button" id="btn-new-student" class="btn primary">＋ 新增學生</button>
+        </div>
+      </div>
+      <div class="filter-bar">
+        <input id="sf-q" type="search" placeholder="搜尋姓名、繳費序號、手機、學校…">
+        <select id="sf-status"><option value="">全部狀態</option><option value="active">在學</option><option value="paused">暫停</option><option value="left">退班</option></select>
+        <select id="sf-branch"></select>
+        <select id="sf-grade"></select>
+      </div>
+      <table class="table">
+        <thead><tr><th>姓名</th><th>繳費序號</th><th>學校／年級</th><th>主要分校</th><th>家長手機</th><th>上的班</th><th>狀態</th></tr></thead>
+        <tbody id="s-rows"></tbody>
+      </table>
+      <p id="s-more" class="muted small center"></p>
+    </section>
+
+    <section id="view-student-editor" class="hidden">
+      <button type="button" class="btn-link js-back-students">← 回學生資料</button>
+      <h2 id="se-title" class="section-title">新增學生</h2>
+      <form id="student-form" class="editor">
+        <div class="form-grid">
+          <label>學生姓名 *
+            <input id="se-name" type="text" maxlength="20" required>
+          </label>
+          <label>繳費序號 *
+            <input id="se-serial" type="text" maxlength="30" required autocapitalize="characters" placeholder="例：A115001">
+          </label>
+          <p id="se-lock-note" class="muted small span2 hidden">改姓名或繳費序號會影響家長登入和各班座位，請找主管修改。</p>
+          <label>家長手機
+            <input id="se-phone" type="tel" maxlength="12" placeholder="0912345678">
+          </label>
+          <label>在學狀態
+            <select id="se-status"><option value="active">在學</option><option value="paused">暫停</option><option value="left">退班</option></select>
+          </label>
+          <label>學校
+            <input id="se-school" type="text" maxlength="30" placeholder="例：培英國中">
+          </label>
+          <label>年級
+            <select id="se-grade"></select>
+          </label>
+          <label>主要分校
+            <select id="se-branch"></select>
+          </label>
+          <label class="span2">備註
+            <textarea id="se-note" rows="2" maxlength="500"></textarea>
+          </label>
+        </div>
+
+        <h3>上的班級</h3>
+        <div class="filter-bar">
+          <select id="se-term"></select>
+          <input id="se-class-q" type="search" placeholder="搜尋班級名稱…">
+          <label class="check inline"><input id="se-only-mine" type="checkbox"> 只看已勾選</label>
+        </div>
+        <div id="se-classes" class="class-picker"></div>
+        <p id="se-class-note" class="muted small"></p>
+
+        <div class="form-actions">
+          <button type="button" id="se-delete" class="btn danger hidden" data-min="manager">刪除學生</button>
+          <span class="spacer"></span>
+          <button type="button" class="btn js-back-students">取消</button>
+          <button type="submit" id="se-submit" class="btn primary">儲存</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="view-profile-import" class="hidden">
+      <button type="button" class="btn-link js-back-students">← 回學生資料</button>
+      <h2 class="section-title">匯入學生資料</h2>
+      <div class="panel">
+        <p class="small">一列一位學生，欄位順序：<b>學生姓名、繳費序號</b>、家長手機、學校、年級、主要分校、狀態、備註。只有前兩欄必填，可以直接從試算表複製貼上（含標題列也沒關係）。</p>
+        <ul class="small muted tight">
+          <li>繳費序號已經存在的學生會<b>更新</b>資料（空白的欄位不會蓋掉原本的資料）；不存在的會<b>新增</b>。</li>
+          <li>序號已經屬於另一個姓名的學生，該列不會匯入，請確認是否打錯字。</li>
+          <li>狀態可以填「在學」「暫停」「退班」，空白當作在學。這裡不會改學生上哪些班；要分班請用「整份名冊匯入」或在學生頁面勾選。</li>
+        </ul>
+        <textarea id="pi-text" rows="10" placeholder="學生姓名	繳費序號	家長手機	學校	年級	主要分校	狀態	備註&#10;王小明	A115001	0912345678	培英國中	國二	愛學館培英校	在學	"></textarea>
+        <p id="pi-status" class="muted small"></p>
+        <div id="pi-problems"></div>
+        <div class="form-actions">
+          <button type="button" id="pi-submit" class="btn primary" disabled>確認匯入</button>
+        </div>
+      </div>
     </section>
 
     <!-- 操作紀錄 -->
