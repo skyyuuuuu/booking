@@ -45,9 +45,15 @@ export function normalizeName(text) {
 
 export const isValidPhone = (phone) => /^09\d{8}$/.test(phone);
 
-// 學生代碼：家長手機_學生姓名（和 firestore.rules 的規則一致）
-export function studentKey(name, phone) {
-  return `${normalizePhone(phone)}_${normalizeName(name)}`;
+// 繳費序號：全形轉半形、去掉空白、英文轉大寫，只允許英數字和 -
+export function normalizeSerial(text) {
+  return String(text || '').normalize('NFKC').replace(/\s/g, '').toUpperCase();
+}
+export const isValidSerial = (serial) => /^[A-Z0-9-]{3,30}$/.test(serial);
+
+// 學生代碼：繳費序號_學生姓名（和 firestore.rules 的規則一致）
+export function studentKey(name, serial) {
+  return `${normalizeSerial(serial)}_${normalizeName(name)}`;
 }
 
 /**
@@ -55,7 +61,7 @@ export function studentKey(name, phone) {
  * 一次 transaction 完成：確認新位子空著 → 有舊位子就一起釋放 → 寫入新位子
  */
 export async function takeSeat(cid, student, seatId) {
-  const { key, name, phone } = student;
+  const { key, name, serial } = student;
   const seatRef = doc(db, 'classes', cid, 'seats', seatId);
   const holderRef = doc(db, 'classes', cid, 'holders', key);
   const bookingRef = doc(collection(db, 'classes', cid, 'bookings'));
@@ -72,7 +78,7 @@ export async function takeSeat(cid, student, seatId) {
       tx.delete(doc(db, 'classes', cid, 'bookings', old.bid));
     }
     tx.set(seatRef, { bid, bookedAt: serverTimestamp() });
-    tx.set(bookingRef, { key, seatId, name, phone, bookedAt: serverTimestamp() });
+    tx.set(bookingRef, { key, seatId, name, serial, bookedAt: serverTimestamp() });
     tx.set(holderRef, { bid, seatId });
   });
 }

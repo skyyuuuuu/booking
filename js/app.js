@@ -3,7 +3,7 @@ import {
   collection, doc, getDoc, onSnapshot
 } from './firebase-sdk.js';
 import {
-  auth, db, configMissing, renderSeatMap, normalizePhone, normalizeName, isValidPhone,
+  auth, db, configMissing, renderSeatMap, normalizeSerial, normalizeName, isValidSerial,
   studentKey, takeSeat, releaseSeat, escapeHtml, classSort, classMeta, toast
 } from './common.js';
 
@@ -12,7 +12,7 @@ const VIEWS = ['view-login', 'view-classes', 'view-seats'];
 
 const state = {
   uid: null,
-  student: null,          // { key, name, phone }
+  student: null,          // { key, name, serial }
   classIds: [],
   classes: new Map(),     // cid -> 班級資料
   holders: new Map(),     // cid -> { bid, seatId }（這個學生在該班的座位）
@@ -65,7 +65,7 @@ function start() {
   started = true;
   const last = loadSaved()[0];
   if (last) {
-    lookupStudent(last.name, last.phone, true);
+    lookupStudent(last.name, last.serial, true);
   } else {
     showLogin();
   }
@@ -73,15 +73,17 @@ function start() {
 
 // ---------- 記住查詢過的學生（方便有兩個孩子的家長切換） ----------
 function loadSaved() {
-  try { return JSON.parse(localStorage.getItem('sb_students') || '[]'); } catch (e) { return []; }
+  try {
+    return JSON.parse(localStorage.getItem('sb_students') || '[]').filter((s) => s && s.name && s.serial);
+  } catch (e) { return []; }
 }
-function saveStudent(name, phone) {
-  const list = loadSaved().filter((s) => !(s.name === name && s.phone === phone));
-  list.unshift({ name, phone });
+function saveStudent(name, serial) {
+  const list = loadSaved().filter((s) => !(s.name === name && s.serial === serial));
+  list.unshift({ name, serial });
   try { localStorage.setItem('sb_students', JSON.stringify(list.slice(0, 5))); } catch (e) { /* 忽略 */ }
 }
-function forgetStudent(name, phone) {
-  const list = loadSaved().filter((s) => !(s.name === name && s.phone === phone));
+function forgetStudent(name, serial) {
+  const list = loadSaved().filter((s) => !(s.name === name && s.serial === serial));
   try { localStorage.setItem('sb_students', JSON.stringify(list)); } catch (e) { /* 忽略 */ }
 }
 
@@ -99,11 +101,11 @@ function showLogin() {
     box.classList.remove('hidden');
     box.querySelectorAll('[data-i]').forEach((b) => b.addEventListener('click', () => {
       const s = saved[b.dataset.i];
-      lookupStudent(s.name, s.phone);
+      lookupStudent(s.name, s.serial);
     }));
     box.querySelectorAll('[data-x]').forEach((b) => b.addEventListener('click', () => {
       const s = saved[b.dataset.x];
-      forgetStudent(s.name, s.phone);
+      forgetStudent(s.name, s.serial);
       showLogin();
     }));
   } else {
@@ -115,29 +117,30 @@ function showLogin() {
 $('login-form').addEventListener('submit', (e) => {
   e.preventDefault();
   const name = normalizeName($('l-name').value);
-  const phone = normalizePhone($('l-phone').value);
+  const serial = normalizeSerial($('l-serial').value);
   if (!name) return toast('請填寫學生姓名', 'error');
-  if (!isValidPhone(phone)) return toast('手機格式不正確，請輸入 09 開頭的 10 碼', 'error');
-  lookupStudent(name, phone);
+  if (!isValidSerial(serial)) return toast('繳費序號格式不正確，請照繳費單上的序號輸入（英文字母、數字）', 'error');
+  lookupStudent(name, serial);
 });
 
-async function lookupStudent(name, phone, silent = false) {
-  const key = studentKey(name, phone);
+async function lookupStudent(name, serial, silent = false) {
+  if (!serial) return showLogin();   // 舊版存的是手機，沒有序號就請家長重新輸入
+  const key = studentKey(name, serial);
   const btn = $('l-submit');
   btn.disabled = true;
   try {
     const snap = await getDoc(doc(db, 'students', key));
     if (!snap.exists() || !(snap.data().classes || []).length) {
       if (silent) return showLogin();
-      forgetStudent(name, phone);
-      toast('查不到這位學生。請確認姓名和手機與報名時相同，或聯絡櫃台。', 'error');
+      forgetStudent(name, serial);
+      toast('查不到這位學生。請確認學生姓名和繳費序號都正確，或聯絡櫃台。', 'error');
       showLogin();
       return;
     }
-    saveStudent(name, phone);
-    state.student = { key, name, phone };
+    saveStudent(name, serial);
+    state.student = { key, name, serial };
     $('l-name').value = '';
-    $('l-phone').value = '';
+    $('l-serial').value = '';
     openStudent();
   } catch (err) {
     console.error(err);
