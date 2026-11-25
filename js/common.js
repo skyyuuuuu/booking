@@ -105,8 +105,50 @@ export function classSort(a, b) {
     || String(a.title || '').localeCompare(String(b.title || ''));
 }
 
+// ---------- 課程類型與期間 ----------
+export const CLASS_TYPES = [
+  { value: 'regular', label: '常態班' },
+  { value: 'short', label: '短期課程' },
+  { value: 'exam', label: '模擬考' },
+  { value: 'other', label: '其他' }
+];
+export const typeLabel = (t) => (CLASS_TYPES.find((x) => x.value === (t || 'regular')) || CLASS_TYPES[0]).label;
+
+// 台灣時間的今天，格式 YYYY-MM-DD
+export function todayStr() {
+  return new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Taipei' });
+}
+
+// 2027-01-20 → 1/20；跨年才顯示年份
+function shortDate(d, withYear) {
+  const [y, m, dd] = String(d).split('-').map(Number);
+  return withYear ? `${y}/${m}/${dd}` : `${m}/${dd}`;
+}
+export function dateRange(c) {
+  const s = c.startDate || '';
+  const e = c.endDate || '';
+  if (!s && !e) return '';
+  const thisYear = todayStr().slice(0, 4);
+  const withYear = (s && s.slice(0, 4) !== thisYear) || (e && e.slice(0, 4) !== thisYear) || (s && e && s.slice(0, 4) !== e.slice(0, 4));
+  if (s && e && s === e) return shortDate(s, withYear);
+  if (s && e) return `${shortDate(s, withYear)}–${shortDate(e, withYear)}`;
+  return s ? `${shortDate(s, withYear)} 起` : `至 ${shortDate(e, withYear)}`;
+}
+
+// 課程狀態：upcoming 未開始 / running 進行中 / ended 已結束 / archived 已封存
+export function periodStatus(c, today = todayStr()) {
+  if (c.archived) return 'archived';
+  if (c.endDate && today > c.endDate) return 'ended';
+  if (c.startDate && today < c.startDate) return 'upcoming';
+  return 'running';
+}
+export const PERIOD_LABEL = { upcoming: '未開始', running: '進行中', ended: '已結束', archived: '已封存' };
+
+// 家長端是否還要顯示：封存的、或過了結束日的都不顯示
+export const visibleToParents = (c) => !c.archived && !(c.endDate && todayStr() > c.endDate);
+
 export function classMeta(c) {
-  return [c.term, c.schedule, c.branch, c.room].filter(Boolean).join('・');
+  return [c.term, dateRange(c), c.schedule, c.branch, c.room].filter(Boolean).join('・');
 }
 
 // 座位代號排序：A1, A2, ..., A10, B1

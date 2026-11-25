@@ -6,7 +6,8 @@ import {
 import {
   auth, db, configMissing, renderSeatMap, buildSeatList, parseNumberList,
   normalizeName, normalizePhone, isValidPhone, normalizeSerial, isValidSerial, studentKey, takeSeat, releaseSeat,
-  escapeHtml, classSort, classMeta, seatOrder, toast
+  escapeHtml, classSort, classMeta, seatOrder, toast,
+  CLASS_TYPES, typeLabel, periodStatus, PERIOD_LABEL, todayStr, dateRange
 } from './common.js';
 import { ADMIN_EMAILS, BRANCHES } from './firebase-config.js';
 
@@ -156,8 +157,30 @@ function backToList() {
 // ---------- 班級列表 ----------
 $('f-branch').innerHTML = ['<option value="">全部分校</option>']
   .concat(BRANCHES.map((b) => `<option>${escapeHtml(b)}</option>`)).join('');
-$('f-branch').addEventListener('change', renderList);
+$('f-type').innerHTML = ['<option value="">全部類型</option>']
+  .concat(CLASS_TYPES.map((t) => `<option value="${t.value}">${t.label}</option>`)).join('');
+['f-branch', 'f-type', 'f-period', 'f-archived'].forEach((id) => $(id).addEventListener('change', renderList));
+$('btn-archive-ended').addEventListener('click', archiveEnded);
 
+// 日期文字 → YYYY-MM-DD（無效回傳 null，空白回傳 ''）
+function parseDateText(t) {
+  const x = String(t || '').trim();
+  if (!x) return '';
+  const m = x.match(/^(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?$/);
+  if (!m) return null;
+  const iso = `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+  const d = new Date(iso + 'T00:00:00');
+  return isNaN(d) || d.getDate() !== Number(m[3]) ? null : iso;
+}
+
+const periodPill = (c) => {
+  const st = periodStatus(c);
+  return `<span class="period ${st}">${PERIOD_LABEL[st]}</span>`;
+};
+const dateRangeText = (c) => dateRange(c) || '';
+const typeTag = (c) => `<span class="type-tag ${escapeHtml(c.type || 'regular')}">${escapeHtml(typeLabel(c.type))}</span>`;
+
+const countCache = new Map();   // cid -> { r, h }，班級資料有變動時清掉
 function startListening() {
   if (state.listUnsub) return;
   state.roomsUnsub = onSnapshot(collection(db, 'rooms'), (snap) => {
@@ -170,6 +193,7 @@ function startListening() {
   });
   state.listUnsub = onSnapshot(collection(db, 'classes'), (snap) => {
     state.classes = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort(classSort);
+    countCache.clear();
     renderList();
   }, (err) => {
     console.error(err);
@@ -190,26 +214,42 @@ function stopListening() {
 function renderList() {
   const box = $('admin-class-list');
   const branch = $('f-branch').value;
-  const list = state.classes.filter((c) => !branch || c.branch === branch);
+  const type = $('f-type').value;
+  const period = $('f-period').value;
+  const showArchived = $('f-archived').checked;
+  const base = state.classes.filter((c) => (!branch || c.branch === branch) && (!type || (c.type || 'regular') === type));
+  const list = base.filter((c) => {
+    const st = periodStatus(c);
+    // 已封存的班級只有勾「顯示已封存」才列出；期間篩選看它原本的狀態
+    if (st === 'archived') return showArchived && (!period || periodStatus({ ...c, archived: false }) === period);
+    return !period || st === period;
+  });
+  const endedCount = base.filter((c) => periodStatus(c) === 'ended').length;
+  $('btn-archive-ended').classList.toggle('hidden', !endedCount);
+  $('btn-archive-ended').textContent = `封存已結束的課程（${endedCount}）`;
+  const archivedCount = base.filter((c) => c.archived).length;
+  $('f-count').textContent = `共 ${list.length} 班${!showArchived && archivedCount ? `（另有 ${archivedCount} 班已封存）` : ''}`;
   if (!list.length) {
     box.innerHTML = state.classes.length
-      ? '<p class="muted">這個分校還沒有班級。</p>'
+      ? '<p class="muted">沒有符合條件的班級。</p>'
       : '<p class="muted">還沒有班級，按右上角「新增班級」開始。</p>';
     return;
   }
   box.innerHTML = list.map((c) => `
-    <div class="card admin-card">
+    <div class="card admin-card ${c.archived ? 'is-archived' : ''}">
       <div class="card-main">
         <div class="card-title">
-          ${escapeHtml(c.title)}
-          <span class="badge ${c.open ? 'on' : 'off'}">${c.open ? '開放劃位中' : '未開放'}</span>
+          ${typeTag(c)}${escapeHtml(c.title)}
+          ${periodPill(c)}
+          ${c.archived ? '' : `<span class="badge ${c.open ? 'on' : 'off'}">${c.open ? '開放劃位中' : '未開放'}</span>`}
         </div>
         <div class="muted small">${escapeHtml(classMeta(c))}</div>
         <div class="small">學生 <b class="cnt-roster" data-cid="${c.id}">…</b> 人・已劃位 <b class="cnt-held" data-cid="${c.id}">…</b>・座位 ${c.seats?.length || 0}</div>
       </div>
       <div class="btn-group">
         <button type="button" class="btn small primary" data-act="detail" data-id="${c.id}">管理名單／座位</button>
-        <button type="button" class="btn small" data-act="toggle" data-id="${c.id}" data-min="manager">${c.open ? '關閉劃位' : '開放劃位'}</button>
+        ${c.archived ? '' : `<button type="button" class="btn small" data-act="toggle" data-id="${c.id}" data-min="manager">${c.open ? '關閉劃位' : '開放劃位'}</button>`}
+        <button type="button" class="btn small" data-act="archive" data-id="${c.id}" data-min="manager">${c.archived ? '取消封存' : '封存'}</button>
         <button type="button" class="btn small" data-act="edit" data-id="${c.id}" data-min="manager">編輯</button>
         <button type="button" class="btn small" data-act="dup" data-id="${c.id}" data-min="manager">複製</button>
         <button type="button" class="btn small danger" data-act="del" data-id="${c.id}" data-min="manager">刪除</button>
@@ -220,24 +260,30 @@ function renderList() {
     const c = state.classes.find((x) => x.id === b.dataset.id);
     if (!c) return;
     ({ detail: (x) => openDetail(x.id), toggle: toggleOpen, edit: (x) => openEditor(x, false),
-       dup: (x) => openEditor(x, true), del: deleteClass })[b.dataset.act](c);
+       dup: (x) => openEditor(x, true), del: deleteClass, archive: (x) => setArchived(x, !x.archived) })[b.dataset.act](c);
   }));
 
   list.forEach(async (c) => {
     try {
-      const [r, h] = await Promise.all([
-        getCountFromServer(collection(db, 'classes', c.id, 'roster')),
-        getCountFromServer(collection(db, 'classes', c.id, 'holders'))
-      ]);
+      // 篩選切換時不重複計數，省讀取次數
+      if (!countCache.has(c.id)) {
+        const [r, h] = await Promise.all([
+          getCountFromServer(collection(db, 'classes', c.id, 'roster')),
+          getCountFromServer(collection(db, 'classes', c.id, 'holders'))
+        ]);
+        countCache.set(c.id, { r: r.data().count, h: h.data().count });
+      }
+      const n = countCache.get(c.id);
       const er = box.querySelector(`.cnt-roster[data-cid="${c.id}"]`);
       const eh = box.querySelector(`.cnt-held[data-cid="${c.id}"]`);
-      if (er) er.textContent = r.data().count;
-      if (eh) eh.textContent = h.data().count;
+      if (er) er.textContent = n.r;
+      if (eh) eh.textContent = n.h;
     } catch (e) { console.warn(e); }
   });
 }
 
 async function toggleOpen(c) {
+  if (c.archived && !c.open) return toast('這個班級已封存，請先取消封存再開放劃位', 'error');
   try {
     await updateDoc(doc(db, 'classes', c.id), { open: !c.open, updatedAt: serverTimestamp() });
     toast(c.open ? '已關閉劃位' : '已開放劃位', 'success');
@@ -257,6 +303,34 @@ $('btn-copy-site').addEventListener('click', async () => {
     prompt('請複製以下網址：', url);
   }
 });
+
+async function setArchived(c, flag) {
+  if (flag && !confirm(`封存「${c.title}」？\n封存後會關閉劃位，家長端不再顯示；班級、名單、座位紀錄都會保留，之後可以取消封存。`)) return;
+  try {
+    await updateDoc(doc(db, 'classes', c.id), flag ? { archived: true, open: false, updatedAt: serverTimestamp() } : { archived: false, updatedAt: serverTimestamp() });
+    toast(flag ? '已封存' : '已取消封存', 'success');
+    log(flag ? '封存班級' : '取消封存', `${flag ? '封存' : '取消封存'}「${c.title}」`, c);
+  } catch (err) {
+    console.error(err);
+    toast(denyMsg(err) || '更新失敗：' + err.code, 'error');
+  }
+}
+
+async function archiveEnded() {
+  const branch = $('f-branch').value;
+  const type = $('f-type').value;
+  const list = state.classes.filter((c) => periodStatus(c) === 'ended' && (!branch || c.branch === branch) && (!type || (c.type || 'regular') === type));
+  if (!list.length) return toast('沒有已結束的課程', 'error');
+  if (!confirm(`封存以下 ${list.length} 個已結束的課程？\n${list.slice(0, 15).map((c) => `・${c.title}（${classMeta(c)}）`).join('\n')}${list.length > 15 ? '\n…' : ''}\n\n班級、名單、座位紀錄都會保留，之後可以取消封存。`)) return;
+  try {
+    await commitInChunks(list.map((c) => (b) => b.update(doc(db, 'classes', c.id), { archived: true, open: false, updatedAt: serverTimestamp() })));
+    toast(`已封存 ${list.length} 個課程`, 'success');
+    log('封存班級', `一次封存 ${list.length} 個已結束的課程：${list.map((c) => c.title).join('、')}`);
+  } catch (err) {
+    console.error(err);
+    toast(denyMsg(err) || '封存失敗：' + err.code, 'error');
+  }
+}
 
 async function deleteClass(c) {
   if (!confirm(`確定要刪除「${c.title}」？\n學生名單和所有座位都會一起刪除，無法復原。`)) return;
@@ -291,6 +365,11 @@ function openEditor(c, duplicate) {
   $('e-title').value = c ? c.title + (duplicate ? '（複製）' : '') : '';
   $('e-term').value = c?.term || '';
   $('e-schedule').value = c?.schedule || '';
+  $('e-type').innerHTML = CLASS_TYPES.map((t) => `<option value="${t.value}">${t.label}</option>`).join('');
+  $('e-type').value = c?.type || $('f-type').value || 'regular';
+  // 複製班級（例如下一期）時不帶日期，避免沿用舊的期間
+  $('e-start').value = c && !duplicate ? (c.startDate || '') : '';
+  $('e-end').value = c && !duplicate ? (c.endDate || '') : '';
   $('e-branch').value = c?.branch || $('f-branch').value || '';
   $('e-room').value = c?.room || '';
   $('e-note').value = c?.note || '';
@@ -358,6 +437,9 @@ $('editor-form').addEventListener('submit', async (e) => {
     title: $('e-title').value.trim(),
     term: $('e-term').value.trim(),
     schedule: $('e-schedule').value.trim(),
+    type: $('e-type').value || 'regular',
+    startDate: $('e-start').value || '',
+    endDate: $('e-end').value || '',
     branch: $('e-branch').value,
     room: $('e-room').value.trim(),
     note: $('e-note').value.trim(),
@@ -366,11 +448,15 @@ $('editor-form').addEventListener('submit', async (e) => {
     updatedAt: serverTimestamp()
   };
   if (!data.title) return toast('請填寫班級名稱', 'error');
+  if (data.startDate && data.endDate && data.endDate < data.startDate) return toast('結束日期不能早於開始日期', 'error');
+  if (data.open && data.endDate && todayStr() > data.endDate && !confirm('結束日期已經過了，家長端不會顯示這個班級。確定要儲存嗎？')) return;
 
   const btn = $('e-submit');
   btn.disabled = true;
   try {
     if (state.editingId) {
+      const cur = state.classes.find((x) => x.id === state.editingId);
+      if (cur?.archived && data.open) { toast('這個班級已封存，請先取消封存再開放劃位', 'error'); return; }
       // 已被劃走的座位不能被刪掉
       const snap = await getDocs(collection(db, 'classes', state.editingId, 'seats'));
       const valid = new Set(layout.seats);
@@ -385,7 +471,7 @@ $('editor-form').addEventListener('submit', async (e) => {
       show('view-list');
     } else {
       const ref = doc(collection(db, 'classes'));
-      await setDoc(ref, { ...data, createdAt: serverTimestamp() });
+      await setDoc(ref, { ...data, archived: false, createdAt: serverTimestamp() });
       // 複製班級時，可選擇一起複製學生名單（例如下學期續班）
       let copied = 0;
       if (state.dupFrom && confirm('要一起複製原班級的學生名單嗎？\n（只複製名單，不複製座位）')) {
@@ -449,7 +535,7 @@ function stopDetail() {
 function renderDetail() {
   const c = state.detail;
   if (!c) return;
-  $('d-title').textContent = c.title;
+  $('d-title').innerHTML = `${typeTag(c)}${escapeHtml(c.title)} ${periodPill(c)}`;
   $('d-meta').textContent = classMeta(c);
   $('d-toggle').textContent = c.open ? '關閉劃位' : '開放劃位';
 
@@ -791,7 +877,7 @@ async function loadAllRosters() {
 function importCandidates() {
   const term = $('i-term').value;
   const branch = $('i-branch').value;
-  return state.classes.filter((c) => (!term || c.term === term) && (!branch || c.branch === branch));
+  return state.classes.filter((c) => !c.archived && (!term || c.term === term) && (!branch || c.branch === branch));
 }
 
 // 解析貼上的名冊：每列 學生姓名、繳費序號、家長手機、班級（手機可空白；班級可用「、」分隔多個）
@@ -1062,7 +1148,8 @@ function parseBatch(text) {
     rows.push({
       raw: line.trim(),
       title: f[0] || '', term: f[1] || '', schedule: f[2] || '', branch: f[3] || '', room: f[4] || '',
-      rowsText: f[5] || '', colsText: f[6] || '', aislesText: f[7] || ''
+      rowsText: f[5] || '', colsText: f[6] || '', aislesText: f[7] || '',
+      typeText: f[8] || '', startText: f[9] || '', endText: f[10] || ''
     });
   });
   return rows;
@@ -1086,6 +1173,13 @@ function analyzeBatch() {
     const item = { ...r, status: 'ok', note: '' };
     if (!r.title) { item.status = 'skip'; item.note = '缺少班級名稱'; return item; }
     if (r.title.length > 60) { item.status = 'skip'; item.note = '班級名稱太長'; return item; }
+    const TYPE_FROM_TEXT = { '': 'regular', 常態班: 'regular', 常態: 'regular', 短期課程: 'short', 短期: 'short', 模擬考: 'exam', 模考: 'exam', 其他: 'other' };
+    if (!(r.typeText in TYPE_FROM_TEXT)) { item.status = 'skip'; item.note = '類型只能填 常態班、短期課程、模擬考、其他'; return item; }
+    item.type = TYPE_FROM_TEXT[r.typeText];
+    item.startDate = parseDateText(r.startText);
+    item.endDate = parseDateText(r.endText);
+    if (item.startDate === null || item.endDate === null) { item.status = 'skip'; item.note = '日期格式不對（例：2027-01-20）'; return item; }
+    if (item.startDate && item.endDate && item.endDate < item.startDate) { item.status = 'skip'; item.note = '結束日期早於開始日期'; return item; }
     const k = keyOf(r.title, r.term, r.branch);
     if (existing.has(k)) { item.status = 'skip'; item.note = '已經有這個班級，略過'; return item; }
     if (seen.has(k)) { item.status = 'skip'; item.note = '清單裡重複，略過'; return item; }
@@ -1121,7 +1215,7 @@ function analyzeBatch() {
 
   $('b-rows-preview').innerHTML = batchPlan.map((x) => `
     <tr class="${x.status === 'skip' ? 'muted' : ''}">
-      <td><b>${escapeHtml(x.title || '（空白）')}</b></td>
+      <td><b>${escapeHtml(x.title || '（空白）')}</b>${x.status === 'ok' ? `<div class="small">${typeTag(x)}${escapeHtml(dateRangeText(x))}</div>` : ''}</td>
       <td>${escapeHtml(x.term)}</td>
       <td>${escapeHtml(x.schedule)}</td>
       <td>${escapeHtml(x.branch)}</td>
@@ -1149,6 +1243,7 @@ async function runBatch() {
       const { rows, cols, aisles, disabled, seats } = x.layout;
       b.set(doc(collection(db, 'classes')), {
         title: x.title, term: x.term, schedule: x.schedule, branch: x.branch, room: x.room, note: '',
+        type: x.type || 'regular', startDate: x.startDate || '', endDate: x.endDate || '', archived: false,
         rows, cols, aisles, disabled, seats, open: false,
         createdAt: serverTimestamp(), updatedAt: serverTimestamp()
       });
@@ -1670,7 +1765,7 @@ function renderClassPicker() {
   const term = $('se-term').value;
   const q = normTitle($('se-class-q').value);
   const onlyMine = $('se-only-mine').checked;
-  const list = state.classes.filter((c) => (state.editSel.has(c.id) || !term || c.term === term)
+  const list = state.classes.filter((c) => (state.editSel.has(c.id) || (!c.archived && (!term || c.term === term)))
     && (!q || normTitle(c.title).includes(q)) && (!onlyMine || state.editSel.has(c.id)));
   const staffLock = !can('manager');
   $('se-classes').innerHTML = list.length ? list.map((c) => {
@@ -1679,7 +1774,7 @@ function renderClassPicker() {
     const seat = state.editSeats.get(c.id);
     return `<label class="${on ? 'on' : ''} ${locked ? 'locked' : ''}" title="${locked ? '移出班級要主管操作' : ''}">
       <input type="checkbox" data-cid="${c.id}" ${on ? 'checked' : ''} ${locked ? 'disabled' : ''}>
-      <span><b>${escapeHtml(c.title)}</b>${seat ? ` <span class="seat-tag">${escapeHtml(seat)}</span>` : ''}
+      <span>${typeTag(c)}<b>${escapeHtml(c.title)}</b>${seat ? ` <span class="seat-tag">${escapeHtml(seat)}</span>` : ''}${c.archived ? ' <span class="period archived">已封存</span>' : ''}
         <div class="meta">${escapeHtml(classMeta(c))}</div></span></label>`;
   }).join('') : '<p class="muted small">沒有符合的班級</p>';
   $('se-classes').querySelectorAll('input[data-cid]').forEach((cb) => cb.addEventListener('change', () => {

@@ -4,7 +4,7 @@ import {
 } from './firebase-sdk.js';
 import {
   auth, db, configMissing, renderSeatMap, normalizeSerial, normalizeName, isValidSerial,
-  studentKey, takeSeat, releaseSeat, escapeHtml, classSort, classMeta, toast
+  studentKey, takeSeat, releaseSeat, escapeHtml, classSort, classMeta, typeLabel, visibleToParents, toast
 } from './common.js';
 
 const $ = (id) => document.getElementById(id);
@@ -218,15 +218,17 @@ function classStatus(c, holder) {
 function renderClassList() {
   if (!state.student) return;
   const list = $('class-list');
-  const classes = state.classIds.map((cid) => state.classes.get(cid)).filter(Boolean).sort(classSort);
+  const loaded = state.classIds.map((cid) => state.classes.get(cid)).filter(Boolean);
+  // 已封存、或過了結束日的課程不顯示
+  const classes = loaded.filter(visibleToParents).sort(classSort);
   if (!classes.length) {
-    list.innerHTML = state.classIds.length ? '<p class="muted">載入中…</p>' : '<p class="muted">目前沒有需要劃位的班級。</p>';
+    list.innerHTML = loaded.length < state.classIds.length ? '<p class="muted">載入中…</p>' : '<p class="muted">目前沒有需要劃位的班級。</p>';
     return;
   }
   list.innerHTML = classes.map((c) => `
     <button type="button" class="card session-card" data-cid="${c.id}">
       <div class="card-main">
-        <div class="card-title">${escapeHtml(c.title)}</div>
+        <div class="card-title"><span class="type-tag ${escapeHtml(c.type || 'regular')}">${escapeHtml(typeLabel(c.type))}</span>${escapeHtml(c.title)}</div>
         <div class="muted small">${escapeHtml(classMeta(c))}</div>
       </div>
       <div class="card-side">${classStatus(c, state.holders.get(c.id))}</div>
@@ -260,9 +262,14 @@ $('btn-back').addEventListener('click', () => closeClass());
 function renderSeats() {
   const c = state.classes.get(state.currentCid);
   if (!c) return;
+  if (!visibleToParents(c)) {
+    toast('這個課程已經結束了');
+    closeClass();
+    return;
+  }
   const holder = state.holders.get(c.id);
 
-  $('s-title').textContent = c.title;
+  $('s-title').innerHTML = `<span class="type-tag ${escapeHtml(c.type || 'regular')}">${escapeHtml(typeLabel(c.type))}</span>${escapeHtml(c.title)}`;
   $('s-meta').textContent = classMeta(c);
   $('s-note').textContent = c.note || '';
 

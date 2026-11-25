@@ -5,7 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex">
   <title>劃位後台</title>
-  <link rel="icon" href="data:,">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <meta name="theme-color" content="#2f6f73">
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body class="admin">
@@ -38,7 +41,6 @@
       <div class="toolbar">
         <h2 class="section-title">班級管理</h2>
         <div class="btn-group">
-          <select id="f-branch" class="inline-select"></select>
           <button type="button" id="btn-copy-site" class="btn">複製家長劃位網址</button>
           <button type="button" id="btn-students" class="btn">學生資料</button>
           <button type="button" id="btn-admins" class="btn" data-min="owner">管理員帳號</button>
@@ -48,6 +50,19 @@
           <button type="button" id="btn-import" class="btn" data-min="manager">整份名冊匯入</button>
           <button type="button" id="btn-new" class="btn primary" data-min="manager">＋ 新增班級</button>
         </div>
+      </div>
+      <div class="filter-bar">
+        <select id="f-branch"></select>
+        <select id="f-type"></select>
+        <select id="f-period">
+          <option value="">全部期間</option>
+          <option value="running">進行中</option>
+          <option value="upcoming">未開始</option>
+          <option value="ended">已結束</option>
+        </select>
+        <label class="check inline"><input id="f-archived" type="checkbox"> 顯示已封存</label>
+        <span id="f-count" class="muted small"></span>
+        <button type="button" id="btn-archive-ended" class="btn small hidden" data-min="manager">封存所有已結束的課程</button>
       </div>
       <div id="admin-class-list" class="card-list"></div>
     </section>
@@ -252,10 +267,11 @@
       <button type="button" class="btn-link js-back">← 回班級列表</button>
       <h2 class="section-title">批次建立班級</h2>
       <div class="panel">
-        <p class="small">從名冊的「班級清單」分頁選取 A～H 欄複製，貼在下面。含標題列也沒關係。一列一個班，欄位順序：</p>
-        <p class="small"><b>班級名稱</b>、學期、上課時間、分校、教室、排數、每排座位數、走道</p>
+        <p class="small">從名冊的「班級清單」分頁選取 A～K 欄複製，貼在下面。含標題列也沒關係。一列一個班，欄位順序：</p>
+        <p class="small"><b>班級名稱</b>、學期、上課時間、分校、教室、排數、每排座位數、走道、類型、開始日期、結束日期</p>
         <ul class="small muted tight">
           <li>只有「班級名稱」必填，其他可以留空。</li>
+          <li>類型填「常態班」「短期課程」「模擬考」「其他」，空白當作常態班。日期格式例如 2027-01-20 或 2027/1/20；模擬考這類只有一天的，開始和結束填同一天。</li>
           <li>排數、每排座位數留空的班級，會套用下面選的預設座位。</li>
           <li>同學期、同分校已經有同名班級的，會自動略過，不會重複建立。</li>
           <li>建好的班級預設「未開放」，加好學生名單後再開放劃位。</li>
@@ -275,7 +291,7 @@
             <input id="b-aisles" type="text" placeholder="例：2, 6">
           </label>
         </div>
-        <textarea id="b-text" rows="8" placeholder="班級名稱	學期	上課時間	分校	教室	排數	每排座位數	走道&#10;高一數學A班	115 上	每週二 19:00-21:00	愛學館培英校	301	6	8	2, 6&#10;高一英文	115 上	每週四 19:00-21:00	愛學館培英校	302"></textarea>
+        <textarea id="b-text" rows="8" placeholder="班級名稱	學期	上課時間	分校	教室	排數	每排座位數	走道	類型	開始日期	結束日期&#10;高一數學A班	115 上	每週二 19:00-21:00	愛學館培英校	301	6	8	2, 6	常態班		&#10;國三寒假衝刺	115 寒假	每天 9:00-12:00	愛學館培英校	302				短期課程	2027-01-20	2027-01-24"></textarea>
         <p id="b-status" class="muted small"></p>
       </div>
 
@@ -342,8 +358,17 @@
           <label>學期
             <input id="e-term" type="text" maxlength="20" placeholder="例：115 上">
           </label>
+          <label>課程類型
+            <select id="e-type"></select>
+          </label>
           <label>上課時間
             <input id="e-schedule" type="text" maxlength="40" placeholder="例：每週二 19:00-21:00">
+          </label>
+          <label>開始日期（可不填）
+            <input id="e-start" type="date">
+          </label>
+          <label>結束日期（可不填；過了這天，家長端就不再顯示）
+            <input id="e-end" type="date">
           </label>
           <label>分校
             <select id="e-branch"></select>

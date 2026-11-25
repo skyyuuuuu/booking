@@ -324,3 +324,15 @@ body:not([data-role="owner"]) [data-min="owner"] { display: none !important; }
 .class-picker .meta { font-size: 0.78rem; color: var(--muted); }
 .form-actions .spacer { flex: 1; }
 .name-link { color: var(--brand-dark); text-decoration: underline; text-decoration-color: rgba(47,111,115,.35); cursor: pointer; background: none; border: 0; padding: 0; font: inherit; }
+
+/* ---------- 課程類型與期間 ---------- */
+.type-tag { display: inline-block; font-size: 0.72rem; font-weight: 600; padding: 1px 8px; border-radius: 99px; margin-right: 6px; vertical-align: 2px; background: var(--brand-soft); color: var(--brand-dark); }
+.type-tag.short { background: #fdf0db; color: #9a6411; }
+.type-tag.exam { background: #ece6fb; color: #5b3fa6; }
+.type-tag.other { background: #eee; color: var(--muted); }
+.period { display: inline-block; font-size: 0.75rem; padding: 1px 8px; border-radius: 99px; margin-left: 6px; vertical-align: 2px; }
+.period.upcoming { background: #e3edf7; color: #1f4e79; }
+.period.running { background: #dff3e6; color: var(--ok); }
+.period.ended { background: #eee; color: var(--muted); }
+.period.archived { background: #f3e8e8; color: #8a2a23; }
+.admin-card.is-archived { opacity: 0.7; }
